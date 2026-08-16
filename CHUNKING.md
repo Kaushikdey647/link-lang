@@ -90,7 +90,7 @@ See `INDEXING.md`'s "Remote (Qdrant Cloud) inference" section for the connection
 
 ### Retrieval: RRF hybrid
 
-`pipeline/query_engines.py::EnglishPivotQueryEngine` fuses two searches server-side via Qdrant's `FusionQuery(fusion=Fusion.RRF)`:
+`frontend/lib/server/retrieval.ts` (ported from the now-retired `pipeline/query_engines.py::EnglishPivotQueryEngine`) fuses two searches server-side via Qdrant's `FusionQuery(fusion=Fusion.RRF)`:
 - **Dense**: the vernacular query, translated to English (Sarvam), embedded via MiniLM
 - **Sparse**: the original vernacular query, embedded via BM25
 
@@ -202,4 +202,4 @@ Qdrant does **Approximate Nearest Neighbour (ANN)** search using the HNSW graph 
 
 ### Latency Budget
 
-The <200ms target applies to the **retrieval sub-pipeline** (translate + embed + Qdrant RRF fusion). Full end-to-end including generation is longer (dominated by Sarvam-105B's reasoning phase, not retrieval) — see `scripts/benchmark.py` for exact P50/P70/P100 measurement and `INDEXING.md` for how to run it against the real cluster.
+The <200ms target applies to the **retrieval sub-pipeline** (translate + embed + Qdrant RRF fusion). Full end-to-end including generation is longer (dominated by Sarvam-105B's reasoning phase, not retrieval). The Python P50/P70/P100 benchmark script (`scripts/benchmark.py`) is retired along with `pipeline/rag.py` — a TypeScript equivalent against `frontend/lib/server/rag.ts` is a planned follow-up (see CHANGELOG.md's `frontend_only` entry).

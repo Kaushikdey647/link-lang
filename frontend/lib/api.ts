@@ -1,4 +1,5 @@
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// Same-origin now that the serving flow is Next.js API routes
+// (frontend/app/api/*) instead of a separate FastAPI backend.
 
 export interface Passage {
   passage_id: string;
@@ -27,7 +28,7 @@ export interface VoiceResult extends QueryResult {
 
 /** Text query — language is auto-detected by the backend. */
 export async function queryText(query: string, topK = 5): Promise<QueryResult> {
-  const res = await fetch(`${API}/query`, {
+  const res = await fetch("/api/query", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query, top_k: topK }),
@@ -45,7 +46,7 @@ export async function queryVoice(audioBlob: Blob, topK = 5): Promise<VoiceResult
   form.append("audio", audioBlob, "recording.webm");
   form.append("top_k", String(topK));
 
-  const res = await fetch(`${API}/voice`, {
+  const res = await fetch("/api/voice", {
     method: "POST",
     body: form,
   });

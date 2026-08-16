@@ -9,10 +9,9 @@ uv run python -m scripts.index --langs hi bn
 
 This is deliberate: indexing is a heavy, occasional, operator-driven task
 (minutes to hours per language), and keeping it out-of-process means the
-running API/admin server has zero control surface for it. The admin UI's
-**Ingestion** tab (`/admin`) is read-only — it shows you what's actually in
-Qdrant (collections, sizes, per-language counts, mapped plan), never a way to
-trigger anything.
+serving side (`frontend/` — see CHANGELOG.md's `frontend_only` entry) has zero
+control surface for it. Nothing in the Next.js serving app can start, stop,
+or trigger an indexing run.
 
 english-pivot (MiniLM dense + BM25 sparse, both computed server-side by
 Qdrant Cloud) is the system's one supported chunking/embedding strategy — see
@@ -110,7 +109,7 @@ uv run python -m scripts.index --langs hi bn --limit 5000
 ```
 Stops after 5,000 passages per language. The checkpoint is left in place (not cleared, not registered as done), so:
 - A later un-limited run continues from passage 5,000 rather than starting over.
-- The Ingestion tab / `registry.json` correctly show it as "not registered" rather than falsely complete.
+- `registry.json` correctly shows it as "not registered" rather than falsely complete.
 
 ---
 
@@ -126,11 +125,9 @@ Written after every batch. Deleted only when a language finishes cleanly (not st
 
 ## Registry (`registry.json`)
 
-`.indexer_checkpoints/registry.json` tracks, per collection: backend, model, chunkers, split, and `lang_counts` (chunks indexed per language that's actually finished). This is what backs:
-- `GET /plans` and the "Registered" column in the Ingestion tab.
-- `best_available_plan()` / `get_plan_by_collection()` (`pipeline/index_plan.py`), used by `RAGChain` to pick a collection at query time when none is specified.
+`.indexer_checkpoints/registry.json` tracks, per collection: backend, model, chunkers, split, and `lang_counts` (chunks indexed per language that's actually finished). This is ingestion-side bookkeeping only now — the Next.js serving side (`frontend/`) does **not** read this file; it resolves the live collection directly from Qdrant and caches it in memory per warm instance (`frontend/lib/server/qdrant.ts::getLiveCollection()`), since a serverless deploy's filesystem doesn't survive across invocations. See CHANGELOG.md's `frontend_only` entry.
 
-It's local-only (gitignored — per-machine run state, not source), so it stays in sync automatically rather than being something you'd manually replicate: `run_indexing()` calls `sync_registry_with_qdrant()` after every run, and `GET /health`/`_get_chain()` (`api/routes/query.py`) also call it — any process that hits Qdrant auto-discovers deterministically-named collections it doesn't yet know about and registers them, and prunes entries for collections that no longer exist. This is what lets a fresh machine pointed at an already-populated shared Qdrant Cloud cluster report ready without needing to have run indexing itself. You never edit this file by hand.
+It's local-only (gitignored — per-machine run state, not source), so it stays in sync automatically: `run_indexing()` calls `sync_registry_with_qdrant()` after every run — any process that hits Qdrant auto-discovers deterministically-named collections it doesn't yet know about and registers them, and prunes entries for collections that no longer exist. You never edit this file by hand.
 
 ---
 
@@ -208,7 +205,7 @@ uv run python -m scripts.index --langs as bn gu hi kn ml mr ne or pa sa ta ur --
 
 ## Observability
 
-Everything indexing writes is visible without touching the CLI again:
-- **Ingestion tab** (`/admin`) — every collection, alias, point count, on-disk size, vector config, mapped plan, registry status, and on-demand per-language breakdown.
-- `GET /plans` — registry contents as JSON.
-- `GET /health` — degraded if no registered plan's collection actually exists in Qdrant.
+The Gradio admin dashboard (Ingestion/Serving tabs) that used to show this is retired along with the rest of the Python serving stack (see CHANGELOG.md's `frontend_only` entry) — a Next.js equivalent is a planned follow-up, not yet built. In the meantime, check indexing progress directly:
+- `GET /api/health` (`frontend/`) — degraded if the live collection doesn't exist/is empty in Qdrant.
+- Qdrant's own dashboard/API (`GET /collections/{name}`, `POST /collections/{name}/points/count`) for point counts and per-language breakdowns.
+- `.indexer_checkpoints/registry.json` and the per-language checkpoint files, directly.

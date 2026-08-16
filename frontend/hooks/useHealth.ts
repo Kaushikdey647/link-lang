@@ -2,8 +2,6 @@
 
 import { useEffect, useState } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-
 type HealthState = "checking" | "ready" | "unreachable";
 
 export function useHealth(pollMs = 8000): HealthState {
@@ -14,7 +12,7 @@ export function useHealth(pollMs = 8000): HealthState {
 
     const check = async () => {
       try {
-        const res = await fetch(`${API}/health`, {
+        const res = await fetch("/api/health", {
           signal: AbortSignal.timeout(3000),
           cache: "no-store",
         });

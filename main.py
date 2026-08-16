@@ -1,13 +1,7 @@
-from dataset import load_language, iter_passages, iter_queries
+"""Deprecated — safe to delete (frontend_only branch).
 
-if __name__ == "__main__":
-    ds = load_language("hi")
-    print(ds)
-
-    # Sample: first 3 passage records (for indexing)
-    for p in list(iter_passages(ds["train"], "hi"))[:3]:
-        print(p.passage_id, p.is_selected, p.text[:80])
-
-    # Sample: first 3 query records (for evaluation)
-    for q in list(iter_queries(ds["validation"], "hi"))[:3]:
-        print(q.query_id, q.query[:80])
+Was a leftover dataset-loading demo script (never actually started the API,
+despite older README instructions claiming otherwise — already flagged this
+session). Redundant with scripts/index.py, the real ingestion entrypoint.
+See CHANGELOG.md.
+"""
