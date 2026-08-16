@@ -26,18 +26,21 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import islice
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PayloadSchemaType, SparseVectorParams, Modifier,
     PointStruct, PointVectors, SparseVector,
+    Document as QdrantDocument,  # aliased: langchain_core.documents.Document is already "Document" in this file
 )
 from tqdm import tqdm
 
@@ -47,16 +50,36 @@ from pipeline.embedder import embed_passages
 from pipeline.lc_embedder import ProjectEmbeddings
 from pipeline.index_plan import IndexPlan, register_plan, sync_registry_with_qdrant
 
-QDRANT_URL = "http://localhost:6333"
+load_dotenv()
+
+QDRANT_URL = os.environ.get("QDRANT_CLUSTER_ENDPOINT") or "http://localhost:6333"
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or None
+# True only when pointed at a real Qdrant Cloud cluster (API key present) —
+# local/self-hosted Qdrant doesn't support server-side cloud inference, so
+# QDRANT_API_KEY's presence is what gates the Document(text=..., model=...)
+# code paths below vs. the local sentence-transformers/fastembed ones.
+QDRANT_CLOUD_INFERENCE = bool(QDRANT_API_KEY)
+
+# Qdrant's inference model registry identifiers — exact casing matters, this
+# is what actually gets sent to Qdrant Cloud, distinct from the human-readable
+# MODEL_NAME_FOR strings in pipeline/index_plan.py.
+MINILM_INFERENCE_MODEL = "sentence-transformers/all-minilm-l6-v2"
+BM25_INFERENCE_MODEL = "qdrant/bm25"
+
 # qdrant-client defaults to a 5s request timeout, which large embed+upsert
 # batches (or a payload-index rebuild on a big collection) can exceed under
 # load — that raised a timeout that killed the whole language indexing run
-# instead of just one slow request.
-QDRANT_INDEXING_TIMEOUT = 60
+# instead of just one slow request. Cloud inference computes embeddings
+# synchronously inside the upsert call, so the remote cluster gets extra
+# headroom over the local-embedding case.
+QDRANT_INDEXING_TIMEOUT = 120 if QDRANT_CLOUD_INFERENCE else 60
 
 
 def _get_qdrant_client() -> QdrantClient:
-    return QdrantClient(url=QDRANT_URL, timeout=QDRANT_INDEXING_TIMEOUT)
+    return QdrantClient(
+        url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=QDRANT_INDEXING_TIMEOUT,
+        cloud_inference=QDRANT_CLOUD_INFERENCE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -152,17 +175,35 @@ def _upsert_batch(client: QdrantClient, plan: IndexPlan,
     sparse) — halves network round-trips for that plan type."""
     ids = [str(uuid.uuid5(uuid.NAMESPACE_DNS, c.chunk_id)) for c in chunks]
     if "english_query" in plan.chunkers:
-        docs   = [_chunk_to_document(c) for c in chunks]
-        dense  = embed_passages([c.text for c in chunks], backend=plan.backend)
-        sparse = sparse_vectors_for([c.parent_passage or c.text for c in chunks])
-        points = [
-            PointStruct(
-                id=pid,
-                vector={"": dv, SPARSE_VECTOR_NAME: sv},
-                payload={"page_content": doc.page_content, "metadata": doc.metadata},
-            )
-            for pid, dv, sv, doc in zip(ids, dense, sparse, docs)
-        ]
+        docs = [_chunk_to_document(c) for c in chunks]
+        if QDRANT_CLOUD_INFERENCE:
+            # Server-side embedding: raw text goes to Qdrant Cloud, which
+            # computes both the dense (MiniLM) and sparse (BM25) vectors —
+            # no local sentence-transformers/fastembed inference at all.
+            points = [
+                PointStruct(
+                    id=pid,
+                    vector={
+                        "": QdrantDocument(text=c.text, model=MINILM_INFERENCE_MODEL),
+                        SPARSE_VECTOR_NAME: QdrantDocument(
+                            text=c.parent_passage or c.text, model=BM25_INFERENCE_MODEL,
+                        ),
+                    },
+                    payload={"page_content": doc.page_content, "metadata": doc.metadata},
+                )
+                for pid, c, doc in zip(ids, chunks, docs)
+            ]
+        else:
+            dense  = embed_passages([c.text for c in chunks], backend=plan.backend)
+            sparse = sparse_vectors_for([c.parent_passage or c.text for c in chunks])
+            points = [
+                PointStruct(
+                    id=pid,
+                    vector={"": dv, SPARSE_VECTOR_NAME: sv},
+                    payload={"page_content": doc.page_content, "metadata": doc.metadata},
+                )
+                for pid, dv, sv, doc in zip(ids, dense, sparse, docs)
+            ]
         client.upsert(collection_name=plan.collection_name, points=points)
     else:
         docs = [_chunk_to_document(c) for c in chunks]

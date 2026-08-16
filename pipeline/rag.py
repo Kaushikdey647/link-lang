@@ -30,7 +30,7 @@ from qdrant_client.models import FieldCondition, Filter, MatchValue
 from pipeline.embedder import DEFAULT_BACKEND
 from pipeline.guardrails import GuardrailResult, check_grounding, check_input, ensure_domain_centroid
 from pipeline.index_plan import IndexPlan, best_available_plan
-from pipeline.indexer import QDRANT_URL, get_vectorstore
+from pipeline.indexer import QDRANT_URL, QDRANT_API_KEY, QDRANT_CLOUD_INFERENCE, get_vectorstore
 from pipeline.query_engines import build_query_engine
 
 load_dotenv()
@@ -120,7 +120,9 @@ class RAGChain:
         self.max_retries = max_retries
 
         self._vectorstore: QdrantVectorStore = get_vectorstore(self.plan)
-        self._qdrant_client = QdrantClient(url=QDRANT_URL)
+        self._qdrant_client = QdrantClient(
+            url=QDRANT_URL, api_key=QDRANT_API_KEY, cloud_inference=QDRANT_CLOUD_INFERENCE,
+        )
         ensure_domain_centroid(_sample_domain_texts(self._qdrant_client, self.plan.collection_name, self.lang))
         self._engine = build_query_engine(
             self.plan,

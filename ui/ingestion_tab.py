@@ -21,7 +21,7 @@ from pipeline.index_plan import (
     get_plan_by_collection, load_registry, parse_collection_name,
     sync_registry_with_qdrant,
 )
-from pipeline.indexer import QDRANT_URL
+from pipeline.indexer import QDRANT_URL, QDRANT_API_KEY
 
 _STATS_TIMEOUT = 30  # read-only queries; generous but not indexing-length
 
@@ -32,7 +32,7 @@ QDRANT_STORAGE_PATH = Path(os.environ.get("QDRANT_STORAGE_PATH", "qdrant_storage
 
 
 def _client() -> QdrantClient:
-    return QdrantClient(url=QDRANT_URL, timeout=_STATS_TIMEOUT)
+    return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=_STATS_TIMEOUT)
 
 
 def _dir_size_bytes(path: Path) -> int:

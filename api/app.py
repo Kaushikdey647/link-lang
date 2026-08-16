@@ -53,10 +53,10 @@ def list_plans() -> dict:
 @app.get("/health", tags=["infra"])
 def health() -> dict:
     from qdrant_client import QdrantClient
-    from pipeline.indexer import QDRANT_URL
+    from pipeline.indexer import QDRANT_URL, QDRANT_API_KEY
     from pipeline.index_plan import load_registry
     try:
-        client  = QdrantClient(url=QDRANT_URL, timeout=2)
+        client  = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=2)
         colls   = {c.name for c in client.get_collections().collections}
         registry = load_registry()
         # Ready if at least one registered plan's collection exists in Qdrant

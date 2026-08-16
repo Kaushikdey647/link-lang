@@ -79,14 +79,20 @@ See [CHUNKING.md](./CHUNKING.md) for detailed strategy documentation.
 
 ```bash
 uv sync
-# Qdrant running locally on :6333
+# Qdrant: either local (default, no env vars needed)...
 docker run -p 6333:6333 qdrant/qdrant
+# ...or a Qdrant Cloud cluster — set QDRANT_CLUSTER_ENDPOINT + QDRANT_API_KEY
+# in .env instead; also switches MiniLM/BM25 embedding to server-side
+# inference (see INDEXING.md).
 ```
 
 Environment variables:
 ```
 SARVAM_API_KEY=...
-COHERE_API_KEY=...   # optional; enables cohere backend
+COHERE_API_KEY=...              # optional; enables cohere backend
+QDRANT_CLUSTER_ENDPOINT=...     # optional; Qdrant Cloud cluster URL — falls back to http://localhost:6333 if unset
+QDRANT_API_KEY=...              # optional; presence also enables Qdrant Cloud server-side inference
+                                 # (MiniLM + BM25 embedding computed remotely instead of locally — see INDEXING.md)
 ```
 
 ### Index a language

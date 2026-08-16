@@ -33,8 +33,12 @@ from qdrant_client.models import (
 )
 
 from pipeline.indexer import (
-    QDRANT_INDEXING_TIMEOUT, QDRANT_URL, SPARSE_VECTOR_NAME, sparse_vectors_for,
+    QDRANT_API_KEY, QDRANT_INDEXING_TIMEOUT, QDRANT_URL, SPARSE_VECTOR_NAME, sparse_vectors_for,
 )
+# Note: this migration's sparse-vector recompute always runs locally (fastembed
+# BM25), even against a cloud cluster — it's a one-time fixup for *old*
+# collections, not part of the cloud-inference ingestion path
+# (pipeline/indexer.py::_upsert_batch). Only auth (api_key) is added here.
 
 _PAYLOAD_INDEXES = [
     ("metadata.lang",        PayloadSchemaType.KEYWORD),
@@ -45,7 +49,7 @@ _PAYLOAD_INDEXES = [
 
 
 def migrate(collection: str, batch_size: int = 256) -> None:
-    client = QdrantClient(url=QDRANT_URL, timeout=QDRANT_INDEXING_TIMEOUT)
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=QDRANT_INDEXING_TIMEOUT)
 
     info = client.get_collection(collection)
     if info.config.params.sparse_vectors and SPARSE_VECTOR_NAME in info.config.params.sparse_vectors:

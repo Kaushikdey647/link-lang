@@ -32,10 +32,12 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     FieldCondition, Filter, FusionQuery, Fusion, MatchAny, MatchValue,
     Prefetch, SparseVector,
+    Document as QdrantDocument,  # aliased: langchain_core.documents.Document is already "Document" here
 )
 
 from pipeline.embedder import embed_query
 from pipeline.index_plan import IndexPlan
+from pipeline.indexer import QDRANT_CLOUD_INFERENCE, MINILM_INFERENCE_MODEL, BM25_INFERENCE_MODEL
 
 load_dotenv()
 
@@ -149,11 +151,15 @@ class EnglishPivotQueryEngine(BaseQueryEngine):
             self._sparse_model = SparseTextEmbedding(model_name=self._SPARSE_MODEL_NAME)
         return self._sparse_model
 
-    def _sparse_query_vector(self, text: str) -> SparseVector:
+    def _sparse_query_vector(self, text: str) -> SparseVector | QdrantDocument:
+        if QDRANT_CLOUD_INFERENCE:
+            return QdrantDocument(text=text, model=BM25_INFERENCE_MODEL)
         emb = next(iter(self._get_sparse_model().query_embed(text)))
         return SparseVector(indices=emb.indices.tolist(), values=emb.values.tolist())
 
-    def _dense_query_vector(self, text: str) -> list[float]:
+    def _dense_query_vector(self, text: str) -> list[float] | QdrantDocument:
+        if QDRANT_CLOUD_INFERENCE:
+            return QdrantDocument(text=text, model=MINILM_INFERENCE_MODEL)
         vector = embed_query(text, backend=self.plan.backend)
         return vector.tolist() if hasattr(vector, "tolist") else vector
 

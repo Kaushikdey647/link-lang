@@ -32,7 +32,7 @@ uv run python -m scripts.index --langs all --workers 4 --backend e5 --chunkers p
 uv run python -m scripts.index --langs hi --limit 5000
 ```
 
-Prerequisite: Qdrant reachable at `http://localhost:6333` (see `README.md`).
+Prerequisite: Qdrant reachable — either local at `http://localhost:6333` (default, see `README.md`) or a Qdrant Cloud cluster via `QDRANT_CLUSTER_ENDPOINT`/`QDRANT_API_KEY` in `.env` (see "Remote (Qdrant Cloud) inference" below).
 
 ---
 
@@ -160,6 +160,70 @@ It stays in sync automatically — `run_indexing()` calls `sync_registry_with_qd
 - **Device selection**: `pipeline/embedder.py` auto-picks the best available accelerator (`mps` → `cuda` → `cpu`) for the local models (`e5`, `english`). Nothing to configure.
 - **Merged upsert**: `english_query` batches compute dense + sparse vectors and upsert both in one Qdrant call, not two.
 - **Parallelism caveat**: always invoke via `uv run python -m scripts.index`, not `python -m pipeline.indexer` directly. `--workers > 1` uses `ProcessPoolExecutor`'s `spawn` start method, which needs to re-import the worker function from a real module path in each child process — running `pipeline/indexer.py` itself as `__main__` breaks that (confirmed: every worker crashes instantly). `scripts/index.py` exists specifically so `pipeline.indexer` is always imported normally. (`fork` was tried as an alternative and rejected: it crashes once MPS/Metal has been touched — an Apple/Objective-C runtime limitation, not fixable from Python.)
+
+---
+
+## Remote (Qdrant Cloud) inference
+
+Setting `QDRANT_CLUSTER_ENDPOINT` + `QDRANT_API_KEY` in `.env` switches two things at once, both gated by the same `QDRANT_API_KEY` presence check (`pipeline/indexer.py::QDRANT_CLOUD_INFERENCE`):
+
+1. **Where Qdrant lives** — every `QdrantClient` in the app (`pipeline/indexer.py`, `pipeline/rag.py`, `ui/ingestion_tab.py`, `api/app.py`, `scripts/migrate_bm25.py`) connects to the cloud cluster instead of `localhost:6333`.
+2. **Who computes the embedding, for the `english`/`english_query` plan only** — instead of running `sentence-transformers/all-MiniLM-L6-v2` and `fastembed`'s BM25 model locally, the client sends raw text as a Qdrant `Document(text=..., model=...)` at both index time (`pipeline/indexer.py::_upsert_batch`) and query time (`pipeline/query_engines.py::EnglishPivotQueryEngine`), and Qdrant Cloud computes the vector server-side (`cloud_inference=True` on the client). The `e5` and `cohere` backends are untouched — they're not part of this switch.
+
+Nothing else about indexing changes: the dataset still streams from the local parquet cache (`dataset/loader.py::iter_language_rows`), chunking still happens locally (`pipeline/chunking.py`) — only the embedding *computation* moves server-side. If `QDRANT_API_KEY` is unset, everything behaves exactly as before (local Qdrant, local embedding) — this is an additive, env-gated switch, not a hard requirement.
+
+### SOP: testing remote embeddings
+
+This can't be verified from every network (the cluster may be unreachable from some VPNs/firewalls) — run these from a network that can actually reach your `QDRANT_CLUSTER_ENDPOINT`, after `.env` has both vars set.
+
+1. **Connectivity + auth check** (no embedding involved yet):
+   ```bash
+   uv run python -c "from pipeline.indexer import _get_qdrant_client; print(_get_qdrant_client().get_collections())"
+   ```
+   A `401`/`403` here means `QDRANT_API_KEY` is wrong; a connection error means `QDRANT_CLUSTER_ENDPOINT` is wrong or the network can't reach it.
+
+2. **Tiny smoke-test ingest** — exercises the cloud-inference upsert path end to end:
+   ```bash
+   uv run python -m scripts.index --langs hi --backend english --chunkers english_query --limit 50
+   ```
+   `ensure_collection()` will create the collection on the remote cluster. If the model name doesn't match Qdrant's registry exactly, or your cluster's plan/tier doesn't include cloud inference, this fails here with a Qdrant-side error naming the problem — it does not silently fall back to local embedding.
+
+3. **Confirm real vectors landed** (not just accepted):
+   ```bash
+   uv run python -c "
+   from pipeline.indexer import _get_qdrant_client
+   from pipeline.index_plan import IndexPlan
+   plan = IndexPlan(backend='english', chunkers=['english_query'], split='train')
+   pts, _ = _get_qdrant_client().scroll(plan.collection_name, limit=1, with_vectors=True)
+   print(pts[0].vector.keys() if isinstance(pts[0].vector, dict) else pts[0].vector)
+   "
+   ```
+   Should print both the unnamed dense vector and the `bm25` sparse vector — non-empty.
+
+4. **Retrieval-only query test** (no `SARVAM_API_KEY` needed — skips generation):
+   ```bash
+   uv run python -c "
+   from pipeline.rag import RAGChain
+   chain = RAGChain(lang='hi')
+   for d in chain.retrieve_only('what was the manhattan project?'):
+       print(d.metadata.get('parent_passage') or d.page_content)
+   "
+   ```
+   This round-trips the query-time `Document(...)`-based dense + sparse Prefetch/RRF fusion — the part that's hardest to reason about without live access.
+
+**Troubleshooting**:
+- Auth errors (401/403) → check `QDRANT_API_KEY`.
+- "Inference not available"/plan-tier errors → your Qdrant Cloud cluster's plan may not include cloud inference; check the cluster's plan/tier.
+- Model-not-found errors → the model identifier must match Qdrant's registry exactly, including casing (`sentence-transformers/all-minilm-l6-v2`, `qdrant/bm25` — both lowercase, per `pipeline/indexer.py::MINILM_INFERENCE_MODEL`/`BM25_INFERENCE_MODEL`).
+- Upsert timeouts → embedding now happens synchronously inside the upsert call, so a large `--batch-size` (default 256) may need lowering (e.g. `--batch-size 64`) over a slower/higher-latency connection to the cluster.
+
+### This task's ingestion command
+
+10,000 passages per language, all 14 languages **except Telugu** (`te`'s train parquet isn't cached locally — confirmed separately):
+```bash
+uv run python -m scripts.index --langs as bn gu hi kn ml mr ne or pa sa ta ur \
+  --backend english --chunkers english_query --limit 10000 --workers 4
+```
 
 ---
 

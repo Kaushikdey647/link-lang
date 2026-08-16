@@ -16,6 +16,14 @@ import os
 import threading
 import time
 
+from dotenv import load_dotenv
+
+# Indexing entrypoints (scripts/index.py) import this module before
+# pipeline.indexer, so COHERE_API_KEY/DEFAULT_BACKEND below need .env loaded
+# here too — nothing upstream of this module's first import can be relied on
+# to have done it (confirmed: `uv run` does not auto-load .env).
+load_dotenv()
+
 # ── Backend registry ──────────────────────────────────────────────────────────
 
 VECTOR_DIM_FOR: dict[str, int] = {
