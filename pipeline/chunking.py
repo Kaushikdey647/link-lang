@@ -28,7 +28,7 @@ from dataset.types import PassageRecord
 class Chunk:
     chunk_id: str
     text: str
-    chunk_type: str           # "passage" | "sentence" | "qa_pair"
+    chunk_type: str           # "passage" | "sentence" | "qa_pair" | "english_query"
     lang: str
     passage_id: str
     query_id: int
@@ -37,6 +37,7 @@ class Chunk:
     answer: str
     query_type: str
     sentence_index: int = -1  # only set for chunk_type == "sentence"
+    parent_passage: str = ""  # full parent text; set on sentence/qa_pair chunks
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +107,7 @@ class SentenceChunker(BaseChunker):
                 text=sent,
                 chunk_type="sentence",
                 sentence_index=i,
+                parent_passage=record.text,  # full passage stored in payload
                 **base,
             )
             for i, sent in enumerate(sentences)
@@ -131,6 +133,30 @@ class QAPairChunker(BaseChunker):
             chunk_id=f"{record.passage_id}__qa",
             text=f"{record.query} {record.text}",
             chunk_type="qa_pair",
+            parent_passage=record.text,   # full passage stored in payload
+            **_base(record),
+        )]
+
+
+# ---------------------------------------------------------------------------
+# Strategy 4: English-pivot (embed English question, store vernacular passage)
+# ---------------------------------------------------------------------------
+
+class EnglishQueryChunker(BaseChunker):
+    """One chunk per record: text = English question (embedded), parent_passage = vernacular passage (returned).
+
+    Use with the "english" embedding backend. Requires record.query to be non-empty
+    (always true for MSMARCO-XI translated records).
+    """
+
+    def chunk(self, record: PassageRecord) -> list[Chunk]:
+        if not record.query:
+            return []
+        return [Chunk(
+            chunk_id=f"{record.passage_id}__enq",
+            text=record.query,          # English question → embedded
+            chunk_type="english_query",
+            parent_passage=record.text, # vernacular passage → returned as context
             **_base(record),
         )]
 
@@ -162,11 +188,13 @@ class CompositeChunker(BaseChunker):
 # Named registry — look up by string key
 # ---------------------------------------------------------------------------
 
+# Leaf strategies only — CompositeChunker is not selectable by name
+# because it requires a list of chunkers as an argument.
 REGISTRY: dict[str, type[BaseChunker]] = {
-    "passage": PassageChunker,
-    "sentence": SentenceChunker,
-    "qa_pair": QAPairChunker,
-    "composite": CompositeChunker,
+    "passage":       PassageChunker,
+    "sentence":      SentenceChunker,
+    "qa_pair":       QAPairChunker,
+    "english_query": EnglishQueryChunker,
 }
 
 

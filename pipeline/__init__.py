@@ -8,9 +8,8 @@ from .chunking import (
     DEFAULT as DEFAULT_CHUNKER,
     Chunk,
 )
-from .indexer import index_language, ensure_collection
-from .retriever import retrieve, RetrievedPassage
-from .generator import generate, GenerationResult
+from .indexer import index_language, ensure_collection, get_vectorstore
+from .index_plan import IndexPlan, best_available_plan, load_registry
 
 __all__ = [
     "BaseChunker",
@@ -23,8 +22,8 @@ __all__ = [
     "Chunk",
     "index_language",
     "ensure_collection",
-    "retrieve",
-    "RetrievedPassage",
-    "generate",
-    "GenerationResult",
+    "get_vectorstore",
+    "IndexPlan",
+    "best_available_plan",
+    "load_registry",
 ]
