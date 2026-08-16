@@ -240,15 +240,41 @@ _LEGACY_COLLECTION_DEFAULTS: dict[str, dict] = {
 }
 
 
+def _lang_counts_for(client: QdrantClient, collection: str) -> dict[str, int]:
+    lang_counts: dict[str, int] = {}
+    for code in LANG_CODE_MAP:
+        try:
+            r = client.count(
+                collection_name=collection,
+                count_filter=Filter(must=[
+                    FieldCondition(key="metadata.lang", match=MatchValue(value=code))
+                ]),
+                exact=False,
+            )
+            if r.count > 0:
+                lang_counts[code] = r.count
+        except Exception:
+            continue
+    return lang_counts
+
+
 def sync_registry_with_qdrant(client: QdrantClient) -> None:
     """Reconcile registry.json against what's actually in Qdrant: drop entries
     whose collection no longer exists (e.g. deleted/recreated outside the app,
-    which would otherwise show as a permanent ghost entry), and auto-register
-    known legacy collections that exist but aren't registered yet."""
+    which would otherwise show as a permanent ghost entry), auto-register known
+    legacy collections that exist but aren't registered yet, and auto-register
+    any deterministically-named IndexPlan collection that's live in Qdrant but
+    missing from the *local* registry.
+
+    That last case matters once Qdrant is a shared remote cluster (Qdrant
+    Cloud): registry.json is local-only (gitignored — it's per-machine run
+    state, not source), so a fresh clone/redeploy/teammate's machine pointed
+    at an already-populated cluster would otherwise see qdrant_ready=False
+    forever (GET /health, best_available_plan()) despite the data genuinely
+    being there — this is what lets it "discover" the shared cluster's state
+    instead of depending on this one machine's indexing history."""
     registry = load_registry()
     to_check = {n: d for n, d in _LEGACY_COLLECTION_DEFAULTS.items() if n not in registry}
-    if not registry and not to_check:
-        return
     try:
         existing = {c.name for c in client.get_collections().collections}
     except Exception:
@@ -259,21 +285,18 @@ def sync_registry_with_qdrant(client: QdrantClient) -> None:
     for name, defaults in to_check.items():
         if name not in existing:
             continue
-        lang_counts = {}
-        for code in LANG_CODE_MAP:
-            try:
-                r = client.count(
-                    collection_name=name,
-                    count_filter=Filter(must=[
-                        FieldCondition(key="metadata.lang", match=MatchValue(value=code))
-                    ]),
-                    exact=False,
-                )
-                if r.count > 0:
-                    lang_counts[code] = r.count
-            except Exception:
-                continue
-        register_legacy_collection(name, lang_counts=lang_counts, **defaults)
+        register_legacy_collection(name, lang_counts=_lang_counts_for(client, name), **defaults)
+
+    registry = load_registry()  # re-load: legacy pass above may have changed it
+    for name in existing:
+        if name in registry:
+            continue
+        plan = parse_collection_name(name)
+        if plan is None:
+            continue
+        lang_counts = _lang_counts_for(client, name)
+        if lang_counts:
+            register_plan(plan, lang_counts)
 
 
 def all_plans() -> list[IndexPlan]:

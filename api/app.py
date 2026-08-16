@@ -54,9 +54,14 @@ def list_plans() -> dict:
 def health() -> dict:
     from qdrant_client import QdrantClient
     from pipeline.indexer import QDRANT_URL, QDRANT_API_KEY
-    from pipeline.index_plan import load_registry
+    from pipeline.index_plan import load_registry, sync_registry_with_qdrant
     try:
         client  = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=2)
+        # registry.json is local-only (gitignored) — sync from live Qdrant
+        # state first so a fresh machine pointed at an already-populated
+        # shared/remote cluster reports ready without needing to have run
+        # indexing itself (see pipeline/index_plan.py::sync_registry_with_qdrant).
+        sync_registry_with_qdrant(client)
         colls   = {c.name for c in client.get_collections().collections}
         registry = load_registry()
         # Ready if at least one registered plan's collection exists in Qdrant

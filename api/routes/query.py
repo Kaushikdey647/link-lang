@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from api.models import QueryRequest, QueryResponse, LatencyBreakdown
 from pipeline.rag import RAGChain
-from pipeline.index_plan import get_plan_by_collection, best_available_plan
+from pipeline.index_plan import get_plan_by_collection, best_available_plan, sync_registry_with_qdrant
 from api.metrics import record_rag_result
 from stt import identify_language
 
@@ -11,12 +11,21 @@ router = APIRouter(prefix="/query", tags=["query"])
 _chains: dict[str, RAGChain] = {}
 
 
+def _resolve_plan(collection: str | None):
+    return get_plan_by_collection(collection) if collection else best_available_plan()
+
+
 def _get_chain(lang: str, collection: str | None = None,
                chunk_types: list[str] | None = None) -> RAGChain:
-    plan = (
-        get_plan_by_collection(collection)
-        if collection else best_available_plan()
-    )
+    plan = _resolve_plan(collection)
+    if plan is None:
+        # registry.json is local-only (gitignored) — on a fresh machine
+        # pointed at an already-populated shared/remote Qdrant cluster, it may
+        # simply never have been synced yet. One-time self-heal before giving
+        # up (cheap once synced — see sync_registry_with_qdrant's docstring).
+        from pipeline.indexer import _get_qdrant_client
+        sync_registry_with_qdrant(_get_qdrant_client())
+        plan = _resolve_plan(collection)
     if plan is None:
         raise HTTPException(
             status_code=503,
