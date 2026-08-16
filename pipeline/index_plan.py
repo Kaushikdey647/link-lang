@@ -7,8 +7,11 @@ before the single-strategy collapse (see CHANGELOG.md) — the remote Qdrant
 Cloud collection populated under the old scheme keeps resolving correctly.
 
 Collection name format:  msmarco_xi__{backend}__{chunkers_sorted}__{split}
-The only supported value today: msmarco_xi__english__english_query__train
-(MiniLM dense + BM25 sparse, both computed server-side by Qdrant Cloud).
+Two valid (backend, chunkers) pairings today, each its own collection:
+  - msmarco_xi__english__english_query__train
+    (MiniLM dense + BM25 sparse, both computed server-side by Qdrant Cloud)
+  - msmarco_xi__multilingual_e5_small__qa_pair__train
+    (multilingual-e5-small dense only, computed server-side by Qdrant Cloud)
 """
 
 from __future__ import annotations
@@ -23,17 +26,20 @@ from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from constants import LANG_CODE_MAP
 
-# "english" (MiniLM dense + BM25 sparse via Qdrant Cloud inference) is the
-# only supported backend — see CHANGELOG.md for why e5/cohere were removed.
-AVAILABLE_BACKENDS: list[str] = ["english"]
-VECTOR_DIM_FOR: dict[str, int] = {"english": 384}
+# "english" (MiniLM dense + BM25 sparse) and "multilingual_e5_small" (dense
+# only) — both computed server-side via Qdrant Cloud inference. See
+# CHANGELOG.md for why e5/cohere were originally removed and later why
+# multilingual_e5_small came back as the qa_pair collection's backend.
+AVAILABLE_BACKENDS: list[str] = ["english", "multilingual_e5_small"]
+VECTOR_DIM_FOR: dict[str, int] = {"english": 384, "multilingual_e5_small": 384}
 
 # Human-readable model identifier stored in the registry
 MODEL_NAME_FOR: dict[str, str] = {
     "english": "sentence-transformers/all-MiniLM-L6-v2",
+    "multilingual_e5_small": "intfloat/multilingual-e5-small",
 }
 
-_BACKEND_PREFERENCE = ["english"]
+_BACKEND_PREFERENCE = ["multilingual_e5_small", "english"]
 
 _REGISTRY_PATH = Path(".indexer_checkpoints/registry.json")
 
@@ -141,10 +147,13 @@ def register_plan(plan: IndexPlan, lang_counts: dict[str, int] | None = None) ->
     _save_registry(registry)
 
 
+_VALID_CHUNKER_KEYS = {"english_query", "qa_pair"}
+
+
 def _split_chunkers(key: str) -> Optional[list[str]]:
-    """Reverse of '_'.join(sorted(chunkers)) — trivial now that english_query
-    is the only chunker key that ever appears in a collection name."""
-    return ["english_query"] if key == "english_query" else None
+    """Reverse of '_'.join(sorted(chunkers)) — trivial since both valid keys
+    are single-chunker names (no multi-chunker plan exists)."""
+    return [key] if key in _VALID_CHUNKER_KEYS else None
 
 
 def parse_collection_name(name: str) -> Optional[IndexPlan]:
@@ -178,7 +187,7 @@ def get_plan_by_collection(collection_name: str) -> Optional[IndexPlan]:
 
 
 def best_available_plan() -> Optional[IndexPlan]:
-    """Return the best registered plan (only "english" is a valid backend now)."""
+    """Return the best registered plan, ranked by _BACKEND_PREFERENCE."""
     registry = load_registry()
     if not registry:
         return None

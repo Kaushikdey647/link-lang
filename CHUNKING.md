@@ -106,20 +106,26 @@ Earlier iterations of this project chunked each passage three additional ways, c
 |---|---|---|
 | `PassageChunker` | One chunk per full vernacular passage | Needed a vernacular-capable embedding model (e5 or Cohere) — removed along with those backends |
 | `SentenceChunker` | Split each passage at sentence boundaries (Latin `.!?` + Devanagari `।॥`), small-to-big expansion back to the parent passage at query time | Same vernacular-embedding dependency; also added a second Qdrant round-trip (scroll for the parent) that english-pivot avoids entirely (`parent_passage` is already inline) |
-| `QAPairChunker` | Query text prepended to the selected passage, biasing the embedding space toward the task distribution | Same vernacular-embedding dependency |
-| `e5` backend | `intfloat/multilingual-e5-small`, local, all 14 languages | Local model inference (`sentence-transformers` + `torch`) — real, measured memory/cold-start cost in production (idle Docker RSS before this removal: ~800MB from imports alone) |
+| `e5` backend (local) | `intfloat/multilingual-e5-small`, local, all 14 languages | Local model inference (`sentence-transformers` + `torch`) — real, measured memory/cold-start cost in production (idle Docker RSS before this removal: ~800MB from imports alone) |
 | `cohere` backend | `Cohere/embed-multilingual-v3.0`, API, 1024-dim | Extra API dependency/cost/rate-limiting for no retrieval-quality requirement this project actually needed once english-pivot covers all 14 languages with one model |
 
 The tradeoff: english-pivot is English-only on the embedding side (by design — that's the entire point of the pivot), so it can't do pure vernacular semantic matching the way `e5`/`cohere` could. In exchange: one model, one collection, no local inference, materially lower latency and memory footprint, and cross-lingual retrieval across all 14 languages without needing a multilingual embedding model at all. Given the <200ms retrieval latency target and a production deployment with real memory constraints, that tradeoff was made deliberately — see CHANGELOG.md for when.
+
+### `QAPairChunker` + `multilingual_e5_small` — reintroduced as a second, separate collection
+
+Unlike the `e5` backend above, this doesn't run a local model — it uses **Qdrant Cloud's server-side inference** for `intfloat/multilingual-e5-small` (dense-only, no BM25 sparse), the same cloud-inference mechanism the english-pivot collection uses for MiniLM/BM25. So this avoids the local-inference memory cost that got `e5` removed originally, while still doing genuine vernacular semantic embedding on the query+passage concatenation. It lives in its own collection (`msmarco_xi__multilingual_e5_small__qa_pair__{split}`) rather than replacing english-pivot — see `scripts/index.py --strategy qa_pair`.
+
+e5 models use an asymmetric `"query: "`/`"passage: "` prefix convention; `pipeline/indexer.py::_e5_text()` prepends `"passage: "` at index time since qa_pair chunks are the retrieval target. Any future query-side embedder for this collection must prefix its query text with `"query: "` to match.
 
 ---
 
 ## IndexPlan
 
-Every index is described by an `IndexPlan` (`pipeline/index_plan.py`): `(backend, chunkers, split)`. Today only one combination is valid — `backend="english"`, `chunkers=["english_query"]` — giving one deterministic collection name:
+Every index is described by an `IndexPlan` (`pipeline/index_plan.py`): `(backend, chunkers, split)`. Two combinations are valid today, each its own deterministic collection name:
 
 ```
 msmarco_xi__english__english_query__{split}
+msmarco_xi__multilingual_e5_small__qa_pair__{split}
 ```
 
 `IndexPlan` kept its `(backend, chunkers, split)` shape rather than collapsing to a hardcoded constant specifically so the collection-name derivation stays compatible with data already indexed under this scheme.

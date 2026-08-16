@@ -1,11 +1,13 @@
 """Chunking for MSMARCO-XI passages.
 
-english-pivot (EnglishQueryChunker) is the system's one supported chunking
-strategy — see CHUNKING.md for the strategies that were prototyped and
-evaluated (passage/sentence/qa_pair chunking, e5/cohere embedding backends)
-before this single-strategy, latency-focused, Qdrant-Cloud-inference-only
-architecture was chosen. That prior code lived here; see CHANGELOG.md for
-when/why it was removed rather than kept as unused-but-present.
+Two supported strategies, each paired with one backend/collection (see
+pipeline/index_plan.py):
+  - EnglishQueryChunker ("english_query")  -> "english" backend (MiniLM+BM25)
+  - QAPairChunker       ("qa_pair")        -> "multilingual_e5_small" backend
+
+QAPairChunker was previously removed (see CHANGELOG.md) when the project
+collapsed to english-pivot only; it's back as an additional, separate
+collection rather than a replacement.
 
     chunker.chunk(record: PassageRecord) -> list[Chunk]
 """
@@ -26,7 +28,7 @@ from dataset.types import PassageRecord
 class Chunk:
     chunk_id: str
     text: str
-    chunk_type: str           # always "english_query"
+    chunk_type: str           # "english_query" | "qa_pair"
     lang: str
     passage_id: str
     query_id: int
@@ -75,16 +77,45 @@ class EnglishQueryChunker(BaseChunker):
         )]
 
 
+class QAPairChunker(BaseChunker):
+    """Concatenate the query with its selected passage.
+
+    Biases the embedding space toward the task distribution — these points
+    are the closest thing to "golden" retrieval units in the dataset.
+    Only emits a chunk when is_selected=True AND the query is non-empty.
+
+    Use with the "multilingual_e5_small" backend — unlike EnglishQueryChunker,
+    the embedded text is vernacular, so it needs a multilingual embedding
+    model rather than the English-pivot MiniLM one.
+    """
+
+    def chunk(self, record: PassageRecord) -> list[Chunk]:
+        if not record.is_selected or not record.query:
+            return []
+        return [Chunk(
+            chunk_id=f"{record.passage_id}__qa",
+            text=f"{record.query} {record.text}",
+            chunk_type="qa_pair",
+            parent_passage=record.text,   # full passage stored in payload
+            **_base(record),
+        )]
+
+
+_REGISTRY: dict[str, type[BaseChunker]] = {
+    "english_query": EnglishQueryChunker,
+    "qa_pair":        QAPairChunker,
+}
+
+
 def build_chunker(names: list[str] | None = None) -> BaseChunker:
-    """english_query is the only supported strategy — validated explicitly so
-    a stale/misconfigured caller fails loudly instead of silently getting the
-    wrong chunker."""
-    if names is not None and names != ["english_query"]:
+    """names must be a single-item list naming one of _REGISTRY's strategies —
+    validated explicitly so a stale/misconfigured caller fails loudly instead
+    of silently getting the wrong chunker."""
+    if names is None or len(names) != 1 or names[0] not in _REGISTRY:
         raise ValueError(
-            f"Unsupported chunkers {names!r} — only ['english_query'] is supported now "
-            "(see CHANGELOG.md for why the other chunking strategies were removed)."
+            f"Unsupported chunkers {names!r} — must be one of {list(_REGISTRY)!r}."
         )
-    return EnglishQueryChunker()
+    return _REGISTRY[names[0]]()
 
 
 # ---------------------------------------------------------------------------
