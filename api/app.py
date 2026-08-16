@@ -2,13 +2,23 @@
 
 Run with:
     uvicorn api.app:app --reload --port 8000
+Production (Render, see render.yaml/Dockerfile):
+    uvicorn api.app:app --host 0.0.0.0 --port $PORT
 
 Endpoints:
     POST /query        — text query → RAG answer
     POST /voice        — audio file → transcript → RAG answer
-    GET  /health       — liveness check
+    GET  /health       — liveness check (Render healthCheckPath)
     GET  /docs         — OpenAPI UI (auto-generated)
+
+Env vars affecting this module (see README.md for the full list):
+    ALLOWED_ORIGINS  — comma-separated CORS origins; "*" (default) if unset.
+    ADMIN_UI_ENABLED — "false" to skip mounting the read-only Gradio /admin
+                       dashboard (e.g. to shrink prod attack surface/cold
+                       start); mounted by default.
 """
+
+import os
 
 import truststore; truststore.inject_into_ssl()
 
@@ -18,8 +28,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.routes.query import router as query_router
 from api.routes.voice import router as voice_router
 from api.metrics import setup_metrics
-from ui.admin_app import build_admin_ui
-import gradio as gr
 
 app = FastAPI(
     title="Bhasha RAG API",
@@ -27,9 +35,10 @@ app = FastAPI(
     version="0.1.0",
 )
 
+_allowed_origins = os.environ.get("ALLOWED_ORIGINS", "*")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"] if _allowed_origins == "*" else [o.strip() for o in _allowed_origins.split(",")],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -39,8 +48,10 @@ app.include_router(voice_router)
 
 setup_metrics(app)
 
-# Mount Gradio UI at /ui
-gr.mount_gradio_app(app, build_admin_ui(), path="/admin")
+if os.environ.get("ADMIN_UI_ENABLED", "true").lower() != "false":
+    from ui.admin_app import build_admin_ui
+    import gradio as gr
+    gr.mount_gradio_app(app, build_admin_ui(), path="/admin")
 
 
 @app.get("/plans", tags=["infra"])

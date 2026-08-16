@@ -1,22 +1,13 @@
-"""Query engines — retrieval strategy for one IndexPlan.
+"""Query engine — retrieval for the one supported IndexPlan.
 
-Mirrors pipeline/chunking.py's BaseChunker/REGISTRY/build_chunker() pattern:
-a base class, concrete strategies, and a factory that picks one from an
-IndexPlan's (backend, chunkers, split) axes.
-
-Two engines today:
-  - VernacularQueryEngine — e5/cohere backends, passage/sentence/qa_pair
-    chunkers. Query embedded as-is; the multilingual model handles
-    cross-lingual matching. Plain dense search via the existing LangChain
-    QdrantVectorStore path.
-  - EnglishPivotQueryEngine — english backend + english_query chunker. RRF
-    fusion of a dense search (English-translated query vs. english_query
-    embeddings) and a BM25 sparse search (original vernacular query vs. the
-    vernacular passage text). The vernacular query is never discarded — it's
-    also what reaches the generation prompt, so translation happens only
-    internally, scoped to the dense side of retrieval.
-
-More engines (one per new retrieval strategy) register in _ENGINE_FOR_CHUNKER.
+EnglishPivotQueryEngine is the system's one retrieval strategy: RRF fusion of
+a dense search (English-translated query vs. english_query embeddings) and a
+BM25 sparse search (original vernacular query vs. the vernacular passage
+text). Both vectors are computed server-side by Qdrant Cloud (Document(...));
+see CHANGELOG.md for why the e5/cohere vernacular-embedding VernacularQueryEngine
+was removed. The vernacular query is never discarded — it's also what reaches
+the generation prompt, so translation happens only internally, scoped to the
+dense side of retrieval.
 """
 
 from __future__ import annotations
@@ -27,17 +18,15 @@ from abc import ABC, abstractmethod
 import truststore; truststore.inject_into_ssl()
 from dotenv import load_dotenv
 from langchain_core.documents import Document
-from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     FieldCondition, Filter, FusionQuery, Fusion, MatchAny, MatchValue,
-    Prefetch, SparseVector,
+    Prefetch,
     Document as QdrantDocument,  # aliased: langchain_core.documents.Document is already "Document" here
 )
 
-from pipeline.embedder import embed_query
 from pipeline.index_plan import IndexPlan
-from pipeline.indexer import QDRANT_CLOUD_INFERENCE, MINILM_INFERENCE_MODEL, BM25_INFERENCE_MODEL
+from pipeline.indexer import MINILM_INFERENCE_MODEL, BM25_INFERENCE_MODEL
 
 load_dotenv()
 
@@ -103,65 +92,33 @@ class BaseQueryEngine(ABC):
 
 
 # ---------------------------------------------------------------------------
-# Strategy 1: vernacular dense (e5 / cohere)
-# ---------------------------------------------------------------------------
-
-class VernacularQueryEngine(BaseQueryEngine):
-    """e5 / cohere backends, passage/sentence/qa_pair chunkers — plain dense
-    search, query embedded as-is (multilingual model handles cross-lingual
-    matching)."""
-
-    def __init__(self, plan: IndexPlan, vectorstore: QdrantVectorStore, chunk_types: list[str] | None = None):
-        super().__init__(plan, chunk_types)
-        self.vectorstore = vectorstore
-
-    def retrieve(self, query: str, lang: str, top_k: int) -> list[Document]:
-        hits = self.vectorstore.similarity_search(
-            query, k=top_k * 4, filter=self.build_filter(lang),
-        )
-        return _dedupe(hits, top_k)
-
-
-# ---------------------------------------------------------------------------
-# Strategy 2: English-pivot RRF hybrid (english backend + english_query)
+# English-pivot RRF hybrid (the one supported strategy)
 # ---------------------------------------------------------------------------
 
 class EnglishPivotQueryEngine(BaseQueryEngine):
-    """english backend + english_query chunker — RRF fusion of:
+    """RRF fusion of:
       - dense: English-translated query vs. english_query embeddings
       - sparse (BM25/IDF): original vernacular query vs. parent_passage text
 
-    Talks to Qdrant directly (LangChain's vectorstore wrapper doesn't expose
-    Prefetch/FusionQuery). The vernacular `query` is never translated away
-    from the caller's perspective — only this engine's internal dense
-    prefetch sees the English version.
+    Both vectors are computed server-side by Qdrant Cloud inference
+    (Document(text=..., model=...)) — no local model inference. Talks to
+    Qdrant directly (Prefetch/FusionQuery aren't exposed via a vectorstore
+    wrapper). The vernacular `query` is never translated away from the
+    caller's perspective — only this engine's internal dense prefetch sees
+    the English version.
     """
 
     SPARSE_VECTOR_NAME = "bm25"
-    _SPARSE_MODEL_NAME = "Qdrant/bm25"
 
     def __init__(self, plan: IndexPlan, client: QdrantClient, chunk_types: list[str] | None = None):
         super().__init__(plan, chunk_types)
         self.client = client
-        self._sparse_model = None
 
-    def _get_sparse_model(self):
-        if self._sparse_model is None:
-            from fastembed import SparseTextEmbedding
-            self._sparse_model = SparseTextEmbedding(model_name=self._SPARSE_MODEL_NAME)
-        return self._sparse_model
+    def _sparse_query_vector(self, text: str) -> QdrantDocument:
+        return QdrantDocument(text=text, model=BM25_INFERENCE_MODEL)
 
-    def _sparse_query_vector(self, text: str) -> SparseVector | QdrantDocument:
-        if QDRANT_CLOUD_INFERENCE:
-            return QdrantDocument(text=text, model=BM25_INFERENCE_MODEL)
-        emb = next(iter(self._get_sparse_model().query_embed(text)))
-        return SparseVector(indices=emb.indices.tolist(), values=emb.values.tolist())
-
-    def _dense_query_vector(self, text: str) -> list[float] | QdrantDocument:
-        if QDRANT_CLOUD_INFERENCE:
-            return QdrantDocument(text=text, model=MINILM_INFERENCE_MODEL)
-        vector = embed_query(text, backend=self.plan.backend)
-        return vector.tolist() if hasattr(vector, "tolist") else vector
+    def _dense_query_vector(self, text: str) -> QdrantDocument:
+        return QdrantDocument(text=text, model=MINILM_INFERENCE_MODEL)
 
     def retrieve(self, query: str, lang: str, top_k: int) -> list[Document]:
         english_query = _translate_to_english(query, lang)
@@ -195,26 +152,13 @@ class EnglishPivotQueryEngine(BaseQueryEngine):
         return _dedupe(docs, top_k)
 
 
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
-
-_ENGINE_FOR_CHUNKER: dict[str, type[BaseQueryEngine]] = {
-    "english_query": EnglishPivotQueryEngine,
-}
-
-
 def build_query_engine(
-    plan: IndexPlan, *,
-    vectorstore: QdrantVectorStore | None = None,
-    client: QdrantClient | None = None,
-    chunk_types: list[str] | None = None,
-) -> BaseQueryEngine:
-    """Pick the retrieval strategy for a plan. Default: VernacularQueryEngine."""
-    engine_cls = next(
-        (cls for chunker, cls in _ENGINE_FOR_CHUNKER.items() if chunker in plan.chunkers),
-        VernacularQueryEngine,
-    )
-    if engine_cls is EnglishPivotQueryEngine:
-        return EnglishPivotQueryEngine(plan, client, chunk_types)
-    return VernacularQueryEngine(plan, vectorstore, chunk_types)
+    plan: IndexPlan, *, client: QdrantClient, chunk_types: list[str] | None = None,
+) -> EnglishPivotQueryEngine:
+    """Only english_query plans are supported now (see CHANGELOG.md)."""
+    if "english_query" not in plan.chunkers:
+        raise NotImplementedError(
+            f"Unsupported chunkers {plan.chunkers!r} — only plans containing "
+            "'english_query' are supported now (see CHANGELOG.md)."
+        )
+    return EnglishPivotQueryEngine(plan, client, chunk_types)

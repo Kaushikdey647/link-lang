@@ -18,8 +18,8 @@ start method can't safely re-import a worker function from a module whose
 identity is __main__).
 
 Usage:
-    uv run python -m scripts.index --langs hi bn --backend english --chunkers english_query
-    uv run python -m scripts.index --langs all --workers 4 --backend e5 --chunkers passage sentence qa_pair
+    uv run python -m scripts.index --langs hi bn
+    uv run python -m scripts.index --langs all --workers 4
     uv run python -m scripts.index --langs hi --limit 5000   # quick test run
 """
 
@@ -35,19 +35,16 @@ from typing import Iterable, Iterator
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document
-from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PayloadSchemaType, SparseVectorParams, Modifier,
-    PointStruct, PointVectors, SparseVector,
+    PointStruct,
     Document as QdrantDocument,  # aliased: langchain_core.documents.Document is already "Document" in this file
 )
 from tqdm import tqdm
 
 from dataset import count_language_rows, iter_language_rows, iter_passages
 from pipeline.chunking import BaseChunker, Chunk, build_chunker
-from pipeline.embedder import embed_passages
-from pipeline.lc_embedder import ProjectEmbeddings
 from pipeline.index_plan import IndexPlan, register_plan, sync_registry_with_qdrant
 
 load_dotenv()
@@ -83,26 +80,12 @@ def _get_qdrant_client() -> QdrantClient:
 
 
 # ---------------------------------------------------------------------------
-# Sparse (BM25/IDF) vector space, only used by english_query plans for RRF
+# Sparse (BM25/IDF) vector space — computed server-side by Qdrant Cloud
+# (see MINILM_INFERENCE_MODEL/BM25_INFERENCE_MODEL above), used for RRF
 # hybrid retrieval (pipeline/query_engines.py:EnglishPivotQueryEngine).
 # ---------------------------------------------------------------------------
 
 SPARSE_VECTOR_NAME = "bm25"
-_sparse_model = None
-
-
-def _get_sparse_model():
-    global _sparse_model
-    if _sparse_model is None:
-        from fastembed import SparseTextEmbedding
-        _sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25")
-    return _sparse_model
-
-
-def sparse_vectors_for(texts: list[str]) -> list[SparseVector]:
-    """BM25 sparse vectors for a batch of (vernacular passage) texts."""
-    embeddings = list(_get_sparse_model().embed(texts))
-    return [SparseVector(indices=e.indices.tolist(), values=e.values.tolist()) for e in embeddings]
 
 
 def ensure_collection(client: QdrantClient, plan: IndexPlan) -> None:
@@ -110,10 +93,9 @@ def ensure_collection(client: QdrantClient, plan: IndexPlan) -> None:
     collection  = plan.collection_name
     needs_bm25  = "english_query" in plan.chunkers
     # get_collections() only lists physical collections, not aliases — a
-    # migrated collection (scripts/migrate_bm25.py) lives under an aliased
-    # name, so without this, ensure_collection would think it doesn't exist
-    # and fail trying to create_collection() over an already-aliased name
-    # (confirmed empirically: Qdrant rejects that with a 400).
+    # A collection reachable only via an alias would otherwise look "missing"
+    # here, and create_collection() over an already-aliased name fails with a
+    # 400 (confirmed empirically).
     existing = {c.name for c in client.get_collections().collections}
     existing |= {a.alias_name for a in client.get_aliases().aliases}
 
@@ -129,15 +111,16 @@ def ensure_collection(client: QdrantClient, plan: IndexPlan) -> None:
     elif needs_bm25:
         # Qdrant can't add a brand-new named vector to a collection that was
         # created without one (confirmed empirically — update_collection only
-        # tunes params of vectors already in the schema). A collection from
-        # before the RRF hybrid strategy existed needs an explicit one-time
-        # migration, not something to attempt silently mid-indexing-run.
+        # tunes params of vectors already in the schema). Every collection
+        # created by this code always includes the sparse vector space from
+        # the start, so this only fires against an externally-created or
+        # otherwise malformed collection — fail loudly rather than silently
+        # indexing dense-only.
         info = client.get_collection(collection)
         if not info.config.params.sparse_vectors or SPARSE_VECTOR_NAME not in info.config.params.sparse_vectors:
             raise RuntimeError(
-                f"Collection {collection!r} predates the RRF hybrid strategy and is "
-                f"missing the {SPARSE_VECTOR_NAME!r} sparse vector space. Run "
-                f"`uv run python -m scripts.migrate_bm25 --collection {collection}` first."
+                f"Collection {collection!r} is missing the {SPARSE_VECTOR_NAME!r} "
+                "sparse vector space required for RRF hybrid retrieval — recreate it."
             )
 
     for field_name, schema in [
@@ -167,47 +150,32 @@ def _chunk_to_document(chunk: Chunk) -> Document:
     return Document(page_content=chunk.text, metadata=meta)
 
 
-def _upsert_batch(client: QdrantClient, plan: IndexPlan,
-                  vectorstore: QdrantVectorStore, chunks: list[Chunk]) -> None:
-    """Embed + upsert one batch. For english_query plans this does dense AND
-    sparse in a single Qdrant round-trip (previously: LangChain's
-    add_documents() for dense, then a second update_vectors() call for
-    sparse) — halves network round-trips for that plan type."""
-    ids = [str(uuid.uuid5(uuid.NAMESPACE_DNS, c.chunk_id)) for c in chunks]
-    if "english_query" in plan.chunkers:
-        docs = [_chunk_to_document(c) for c in chunks]
-        if QDRANT_CLOUD_INFERENCE:
-            # Server-side embedding: raw text goes to Qdrant Cloud, which
-            # computes both the dense (MiniLM) and sparse (BM25) vectors —
-            # no local sentence-transformers/fastembed inference at all.
-            points = [
-                PointStruct(
-                    id=pid,
-                    vector={
-                        "": QdrantDocument(text=c.text, model=MINILM_INFERENCE_MODEL),
-                        SPARSE_VECTOR_NAME: QdrantDocument(
-                            text=c.parent_passage or c.text, model=BM25_INFERENCE_MODEL,
-                        ),
-                    },
-                    payload={"page_content": doc.page_content, "metadata": doc.metadata},
-                )
-                for pid, c, doc in zip(ids, chunks, docs)
-            ]
-        else:
-            dense  = embed_passages([c.text for c in chunks], backend=plan.backend)
-            sparse = sparse_vectors_for([c.parent_passage or c.text for c in chunks])
-            points = [
-                PointStruct(
-                    id=pid,
-                    vector={"": dv, SPARSE_VECTOR_NAME: sv},
-                    payload={"page_content": doc.page_content, "metadata": doc.metadata},
-                )
-                for pid, dv, sv, doc in zip(ids, dense, sparse, docs)
-            ]
-        client.upsert(collection_name=plan.collection_name, points=points)
-    else:
-        docs = [_chunk_to_document(c) for c in chunks]
-        vectorstore.add_documents(docs, ids=ids)
+def _upsert_batch(client: QdrantClient, plan: IndexPlan, chunks: list[Chunk]) -> None:
+    """Embed + upsert one batch via Qdrant Cloud server-side inference — dense
+    (MiniLM) and sparse (BM25) vectors are both computed remotely from raw
+    text in a single Qdrant round-trip; no local model inference at all.
+    Only english_query plans are supported (see CHANGELOG.md)."""
+    if "english_query" not in plan.chunkers:
+        raise NotImplementedError(
+            f"Unsupported chunkers {plan.chunkers!r} — only ['english_query'] is "
+            "supported for indexing now (see CHANGELOG.md)."
+        )
+    ids  = [str(uuid.uuid5(uuid.NAMESPACE_DNS, c.chunk_id)) for c in chunks]
+    docs = [_chunk_to_document(c) for c in chunks]
+    points = [
+        PointStruct(
+            id=pid,
+            vector={
+                "": QdrantDocument(text=c.text, model=MINILM_INFERENCE_MODEL),
+                SPARSE_VECTOR_NAME: QdrantDocument(
+                    text=c.parent_passage or c.text, model=BM25_INFERENCE_MODEL,
+                ),
+            },
+            payload={"page_content": doc.page_content, "metadata": doc.metadata},
+        )
+        for pid, c, doc in zip(ids, chunks, docs)
+    ]
+    client.upsert(collection_name=plan.collection_name, points=points)
 
 
 def _batched(it: Iterable, n: int) -> Iterator[list]:
@@ -277,11 +245,6 @@ def index_language(
 
     client = _get_qdrant_client()
     ensure_collection(client, plan)
-    vectorstore = QdrantVectorStore(
-        client=client,
-        collection_name=plan.collection_name,
-        embedding=ProjectEmbeddings(backend=plan.backend),
-    )
 
     ckpt          = load_checkpoint(plan, lang)
     start_passage = ckpt["passages_done"]
@@ -308,12 +271,12 @@ def index_language(
             passage_idx += 1
             pbar.update(1)
             if len(batch) >= batch_size:
-                _upsert_batch(client, plan, vectorstore, batch)
+                _upsert_batch(client, plan, batch)
                 done_chunks += len(batch)
                 _save_checkpoint(plan, lang, passage_idx, done_chunks)
                 batch = []
         if batch:
-            _upsert_batch(client, plan, vectorstore, batch)
+            _upsert_batch(client, plan, batch)
             done_chunks += len(batch)
             _save_checkpoint(plan, lang, passage_idx, done_chunks)
 
@@ -336,21 +299,18 @@ def run_indexing(langs: list[str], plan: IndexPlan, batch_size: int,
         for lang in langs:
             index_language(lang, plan, batch_size, limit=limit)
     else:
-        # Separate OS processes, not threads — embedding is CPU-bound and
-        # GIL-bound, and each language is already fully independent (own
-        # dataset slice, own checkpoint file, own point IDs post lang-prefix
-        # fix in dataset/passages.py).
+        # Separate OS processes, not threads — network I/O to Qdrant Cloud
+        # releases the GIL either way, but each language is already fully
+        # independent (own dataset slice, own checkpoint file, own point IDs
+        # post lang-prefix fix in dataset/passages.py), so process isolation
+        # costs nothing extra.
         #
-        # Default "spawn" start method — NOT "fork": once MPS/Metal has been
-        # touched (device selection in pipeline/embedder.py), forking crashes
-        # ("MPSGraphObject initialize... Crashing instead", an Apple/Metal +
-        # Objective-C runtime limitation, not fixable from Python). spawn
-        # avoids that by starting genuinely fresh interpreters — which is
-        # exactly why the CLI entrypoint lives in scripts/index.py rather than
-        # this module's own __main__: spawn needs to re-import the worker
-        # function (index_language) from a real module path, and a module
-        # executed as `python -m pipeline.indexer` registers itself as
-        # __main__, which spawn cannot safely re-import in child processes.
+        # Default "spawn" start method: needed regardless of local-model
+        # concerns because the CLI entrypoint lives in scripts/index.py
+        # rather than this module's own __main__ — spawn needs to re-import
+        # the worker function (index_language) from a real module path, and
+        # a module executed as `python -m pipeline.indexer` registers itself
+        # as __main__, which spawn cannot safely re-import in child processes.
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(index_language, lang, plan, batch_size, None, limit): lang
@@ -364,15 +324,6 @@ def run_indexing(langs: list[str], plan: IndexPlan, batch_size: int,
                     print(f"[{lang}] FAILED: {exc}")
 
     sync_registry_with_qdrant(_get_qdrant_client())
-
-
-def get_vectorstore(plan: IndexPlan) -> QdrantVectorStore:
-    """Return a QdrantVectorStore for an existing collection described by plan."""
-    return QdrantVectorStore(
-        client=_get_qdrant_client(),
-        collection_name=plan.collection_name,
-        embedding=ProjectEmbeddings(backend=plan.backend),
-    )
 
 
 # No `if __name__ == "__main__":` here on purpose — the CLI entrypoint is

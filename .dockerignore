@@ -1,0 +1,21 @@
+# Never send these into the build context — build is only for api/pipeline/dataset/ui.
+frontend/
+voice-HHGoa/
+qdrant_storage/
+.indexer_checkpoints/
+benchmarks/
+.git/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets — set via Render env vars, never baked into the image
+.env
+.env.*
+
+# Local-only scratch/demo files not needed for serving
+main.py
+_reindex_100k_test.py

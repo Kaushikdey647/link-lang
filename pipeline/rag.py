@@ -22,15 +22,12 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_qdrant import QdrantVectorStore
 from langchain_sarvam import ChatSarvam
 from qdrant_client import QdrantClient
-from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-from pipeline.embedder import DEFAULT_BACKEND
-from pipeline.guardrails import GuardrailResult, check_grounding, check_input, ensure_domain_centroid
+from pipeline.guardrails import GuardrailResult, check_grounding, check_input
 from pipeline.index_plan import IndexPlan, best_available_plan
-from pipeline.indexer import QDRANT_URL, QDRANT_API_KEY, QDRANT_CLOUD_INFERENCE, get_vectorstore
+from pipeline.indexer import QDRANT_URL, QDRANT_API_KEY, QDRANT_CLOUD_INFERENCE
 from pipeline.query_engines import build_query_engine
 
 load_dotenv()
@@ -67,27 +64,6 @@ class RAGResponse:
     error: str = ""
 
 
-def _sample_domain_texts(client: QdrantClient, collection: str, lang: str, limit: int = 250) -> list[str]:
-    """Small sample of already-indexed passage text, used once to seed the
-    off-topic guardrail's domain centroid (pipeline/guardrails.py). Falls back
-    to an unfiltered sample if nothing matches `lang` yet."""
-    try:
-        points, _ = client.scroll(
-            collection_name=collection,
-            scroll_filter=Filter(must=[FieldCondition(key="metadata.lang", match=MatchValue(value=lang))]),
-            limit=limit,
-            with_payload=True,
-            with_vectors=False,
-        )
-        if not points:
-            points, _ = client.scroll(
-                collection_name=collection, limit=limit, with_payload=True, with_vectors=False,
-            )
-        return [p.payload["page_content"] for p in points if p.payload.get("page_content")]
-    except Exception:
-        return []
-
-
 class RAGChain:
     """Harness wrapping retrieval + Sarvam-105B generation with guardrails.
 
@@ -112,23 +88,18 @@ class RAGChain:
         self.top_k = top_k
         # Resolve plan: explicit > best from registry > safe default
         self.plan = plan or best_available_plan() or IndexPlan(
-            backend=DEFAULT_BACKEND,
-            chunkers=["passage", "sentence", "qa_pair"],
+            backend="english",
+            chunkers=["english_query"],
         )
         self.chunk_types = chunk_types or self.plan.chunkers
         self.reasoning_effort = reasoning_effort
         self.max_retries = max_retries
 
-        self._vectorstore: QdrantVectorStore = get_vectorstore(self.plan)
         self._qdrant_client = QdrantClient(
             url=QDRANT_URL, api_key=QDRANT_API_KEY, cloud_inference=QDRANT_CLOUD_INFERENCE,
         )
-        ensure_domain_centroid(_sample_domain_texts(self._qdrant_client, self.plan.collection_name, self.lang))
         self._engine = build_query_engine(
-            self.plan,
-            vectorstore=self._vectorstore,
-            client=self._qdrant_client,
-            chunk_types=self.chunk_types,
+            self.plan, client=self._qdrant_client, chunk_types=self.chunk_types,
         )
         self._llm = ChatSarvam(
             api_key=os.environ.get("SARVAM_API_KEY", ""),
@@ -259,8 +230,8 @@ class RAGChain:
     def _format_context(docs: list[Document]) -> str:
         parts = []
         for i, d in enumerate(docs):
-            # Use full parent passage if available (sentence/qa_pair chunks);
-            # fall back to the chunk text itself (passage chunks).
+            # english_query chunks embed the English question but return the
+            # vernacular passage (parent_passage) as LLM context.
             text = d.metadata.get("parent_passage") or d.page_content
             parts.append(f"[{i+1}] {text}")
         return "\n\n".join(parts)

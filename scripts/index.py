@@ -12,9 +12,13 @@ this script is a different module, pipeline.indexer is always imported
 normally, so spawn works.
 
 Usage:
-    uv run python -m scripts.index --langs hi bn --backend english --chunkers english_query
-    uv run python -m scripts.index --langs all --workers 4 --backend e5 --chunkers passage sentence qa_pair
+    uv run python -m scripts.index --langs hi bn
+    uv run python -m scripts.index --langs all --workers 4
     uv run python -m scripts.index --langs hi --limit 5000   # quick test run
+
+Backend/chunker are no longer CLI flags — english-pivot (MiniLM dense + BM25
+sparse, both via Qdrant Cloud server-side inference) is the system's one
+supported strategy (see CHANGELOG.md).
 """
 
 from __future__ import annotations
@@ -22,7 +26,6 @@ from __future__ import annotations
 import argparse
 
 from constants import LANG_CODE_MAP
-from pipeline.embedder import AVAILABLE_BACKENDS, DEFAULT_BACKEND
 from pipeline.index_plan import IndexPlan
 from pipeline.indexer import run_indexing
 
@@ -30,8 +33,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--langs", nargs="+", default=["hi"],
                        help="Language codes to index, or 'all' for all 14")
-    parser.add_argument("--backend",  default=DEFAULT_BACKEND, choices=AVAILABLE_BACKENDS)
-    parser.add_argument("--chunkers", nargs="+", default=["passage", "sentence", "qa_pair"])
     parser.add_argument("--split",    default="train")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--workers", type=int, default=1,
@@ -41,5 +42,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     langs = list(LANG_CODE_MAP.keys()) if args.langs == ["all"] else args.langs
-    plan = IndexPlan(backend=args.backend, chunkers=args.chunkers, split=args.split)
+    plan = IndexPlan(backend="english", chunkers=["english_query"], split=args.split)
     run_indexing(langs, plan, args.batch_size, args.workers, args.limit)

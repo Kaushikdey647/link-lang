@@ -1,0 +1,26 @@
+# Render Blueprint for the Bhasha RAG API (backend only — frontend/ deploys
+# separately, e.g. to Vercel). Apply via Render's "New > Blueprint" pointed at
+# this repo, then fill in the `sync: false` env vars in the dashboard.
+services:
+  - type: web
+    name: bhasha-rag-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter   # measured ~265MB RSS at idle (down from ~804MB before
+                    # removing torch/sentence-transformers/fastembed — see
+                    # CHANGELOG.md's single-strategy collapse). Comfortably
+                    # fits a 512MB tier; verify against Render's current plan
+                    # RAM before choosing.
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: SARVAM_API_KEY
+        sync: false
+      - key: QDRANT_CLUSTER_ENDPOINT
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false   # e.g. https://your-frontend.vercel.app — "*" if left unset
+      - key: ADMIN_UI_ENABLED
+        value: "true"

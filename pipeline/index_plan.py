@@ -1,14 +1,14 @@
 """IndexPlan — the authoritative descriptor of how a Qdrant collection was built.
 
-A plan = (backend × chunkers × split) → deterministic collection name.
-The registry persists plan metadata so the query layer can discover what
-embeddings are available and which model to load for each collection.
+A plan = (backend × chunkers × split) → deterministic collection name. Kept
+as a dataclass of (currently fixed) values rather than hardcoded constants so
+the collection-name derivation and registry persistence stay unchanged from
+before the single-strategy collapse (see CHANGELOG.md) — the remote Qdrant
+Cloud collection populated under the old scheme keeps resolving correctly.
 
 Collection name format:  msmarco_xi__{backend}__{chunkers_sorted}__{split}
-Examples:
-  msmarco_xi__english__english_query__train
-  msmarco_xi__cohere__passage_qa_pair_sentence__train
-  msmarco_xi__e5__passage__validation
+The only supported value today: msmarco_xi__english__english_query__train
+(MiniLM dense + BM25 sparse, both computed server-side by Qdrant Cloud).
 """
 
 from __future__ import annotations
@@ -22,18 +22,18 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from constants import LANG_CODE_MAP
-from pipeline.chunking import REGISTRY
-from pipeline.embedder import AVAILABLE_BACKENDS, VECTOR_DIM_FOR
 
-# Human-readable model identifiers stored in the registry
+# "english" (MiniLM dense + BM25 sparse via Qdrant Cloud inference) is the
+# only supported backend — see CHANGELOG.md for why e5/cohere were removed.
+AVAILABLE_BACKENDS: list[str] = ["english"]
+VECTOR_DIM_FOR: dict[str, int] = {"english": 384}
+
+# Human-readable model identifier stored in the registry
 MODEL_NAME_FOR: dict[str, str] = {
-    "e5":      "intfloat/multilingual-e5-small",
-    "cohere":  "Cohere/embed-multilingual-v3.0",
     "english": "sentence-transformers/all-MiniLM-L6-v2",
 }
 
-# Backend preference for auto-selection (higher index = preferred)
-_BACKEND_PREFERENCE = ["e5", "english", "cohere"]
+_BACKEND_PREFERENCE = ["english"]
 
 _REGISTRY_PATH = Path(".indexer_checkpoints/registry.json")
 
@@ -141,45 +141,10 @@ def register_plan(plan: IndexPlan, lang_counts: dict[str, int] | None = None) ->
     _save_registry(registry)
 
 
-def register_legacy_collection(collection_name: str, backend: str, chunkers: list[str],
-                               split: str, lang_counts: dict[str, int] | None = None) -> None:
-    """Register a pre-refactor collection whose name doesn't follow the
-    deterministic IndexPlan.collection_name format (e.g. `msmarco_xi_e5`),
-    so it still shows up in the registry and query layer instead of being
-    permanently invisible to `all_plans()`/`best_available_plan()`."""
-    registry = load_registry()
-    entry = registry.get(collection_name, {
-        "collection_name": collection_name,
-        "backend":         backend,
-        "model_name":      MODEL_NAME_FOR.get(backend, backend),
-        "vector_dim":      VECTOR_DIM_FOR[backend],
-        "chunkers":        chunkers,
-        "split":           split,
-    })
-    if lang_counts:
-        existing = entry.get("lang_counts", {})
-        existing.update({k: v for k, v in lang_counts.items() if v > 0})
-        entry["lang_counts"] = existing
-    registry[collection_name] = entry
-    _save_registry(registry)
-
-
 def _split_chunkers(key: str) -> Optional[list[str]]:
-    """Reverse of '_'.join(sorted(chunkers)) — greedy longest-match against
-    REGISTRY keys, since some keys (qa_pair, english_query) contain '_'."""
-    tokens = key.split("_")
-    chunkers: list[str] = []
-    i, n = 0, len(tokens)
-    while i < n:
-        for j in range(n, i, -1):
-            candidate = "_".join(tokens[i:j])
-            if candidate in REGISTRY:
-                chunkers.append(candidate)
-                i = j
-                break
-        else:
-            return None
-    return chunkers
+    """Reverse of '_'.join(sorted(chunkers)) — trivial now that english_query
+    is the only chunker key that ever appears in a collection name."""
+    return ["english_query"] if key == "english_query" else None
 
 
 def parse_collection_name(name: str) -> Optional[IndexPlan]:
@@ -213,7 +178,7 @@ def get_plan_by_collection(collection_name: str) -> Optional[IndexPlan]:
 
 
 def best_available_plan() -> Optional[IndexPlan]:
-    """Return the best registered plan: prefer cohere > english > e5."""
+    """Return the best registered plan (only "english" is a valid backend now)."""
     registry = load_registry()
     if not registry:
         return None
@@ -234,11 +199,6 @@ def best_available_plan() -> Optional[IndexPlan]:
 # completes, and by the read-only Ingestion tab on refresh — moved here from
 # ui/indexing.py so both can share it without either depending on the UI).
 # ---------------------------------------------------------------------------
-
-_LEGACY_COLLECTION_DEFAULTS: dict[str, dict] = {
-    "msmarco_xi_e5": {"backend": "e5", "chunkers": ["passage", "sentence", "qa_pair"], "split": "train"},
-}
-
 
 def _lang_counts_for(client: QdrantClient, collection: str) -> dict[str, int]:
     lang_counts: dict[str, int] = {}
@@ -261,8 +221,7 @@ def _lang_counts_for(client: QdrantClient, collection: str) -> dict[str, int]:
 def sync_registry_with_qdrant(client: QdrantClient) -> None:
     """Reconcile registry.json against what's actually in Qdrant: drop entries
     whose collection no longer exists (e.g. deleted/recreated outside the app,
-    which would otherwise show as a permanent ghost entry), auto-register known
-    legacy collections that exist but aren't registered yet, and auto-register
+    which would otherwise show as a permanent ghost entry), and auto-register
     any deterministically-named IndexPlan collection that's live in Qdrant but
     missing from the *local* registry.
 
@@ -273,8 +232,6 @@ def sync_registry_with_qdrant(client: QdrantClient) -> None:
     forever (GET /health, best_available_plan()) despite the data genuinely
     being there — this is what lets it "discover" the shared cluster's state
     instead of depending on this one machine's indexing history."""
-    registry = load_registry()
-    to_check = {n: d for n, d in _LEGACY_COLLECTION_DEFAULTS.items() if n not in registry}
     try:
         existing = {c.name for c in client.get_collections().collections}
     except Exception:
@@ -282,12 +239,7 @@ def sync_registry_with_qdrant(client: QdrantClient) -> None:
 
     prune_missing_collections(existing)
 
-    for name, defaults in to_check.items():
-        if name not in existing:
-            continue
-        register_legacy_collection(name, lang_counts=_lang_counts_for(client, name), **defaults)
-
-    registry = load_registry()  # re-load: legacy pass above may have changed it
+    registry = load_registry()
     for name in existing:
         if name in registry:
             continue

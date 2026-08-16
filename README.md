@@ -15,11 +15,11 @@ Voice → Sarvam STT → embed → Qdrant ANN → Sarvam-105B → answer
 | Component | Technology | Role |
 |---|---|---|
 | STT | Sarvam Saaras v3 | Vernacular speech → text |
-| Embedding | `multilingual-e5-small` / `all-MiniLM-L6-v2` / Cohere v3 | Text → vectors |
-| Vector DB | Qdrant (local or remote) | ANN retrieval + payload filter |
-| Translation | Sarvam `sarvam-translate:v1` | Query → English (english-pivot path only) |
+| Embedding | `all-MiniLM-L6-v2` (dense) + BM25 (sparse) — both computed server-side by Qdrant Cloud | Text → vectors |
+| Vector DB | Qdrant Cloud | ANN retrieval + payload filter + RRF fusion |
+| Translation | Sarvam `sarvam-translate:v1` | Query → English (english-pivot retrieval) |
 | Generation | `sarvam-m` / `sarvam-105b` | Grounded answer in target language |
-| Admin UI | Gradio | Indexing control + pipeline visualization |
+| Admin UI | Gradio | Read-only observability (Serving + Ingestion tabs) |
 | API | FastAPI | `/query`, `/voice`, `/plans`, `/health` |
 
 ### Dataset: MSMARCO-XI
@@ -37,35 +37,28 @@ Each row contains:
 
 ### IndexPlan
 
-Every index is described by an `IndexPlan = (backend, chunkers, split)` which determines a deterministic Qdrant collection name:
+english-pivot is the system's one supported strategy (see CHUNKING.md for what
+else was prototyped and why this was chosen) — `backend="english"`,
+`chunkers=["english_query"]` is the only valid `IndexPlan`, giving one
+deterministic collection name:
 
 ```
-msmarco_xi__{backend}__{sorted_chunkers}__{split}
+msmarco_xi__english__english_query__{split}
 ```
 
-Examples:
-- `msmarco_xi__english__english_query__train` — English-pivot, all-MiniLM (recommended)
-- `msmarco_xi__e5__passage_sentence_qa_pair__train` — full vernacular, e5
-- `msmarco_xi__cohere__passage__train` — passage-only, Cohere
+### Chunking + embedding strategy
 
-### Chunking Strategies
+| | |
+|---|---|
+| Chunker | `english_query` — embeds the English question (`Eng_Query`), returns the vernacular passage as context |
+| Dense embedding | `sentence-transformers/all-MiniLM-L6-v2`, 384-dim — computed server-side by Qdrant Cloud |
+| Sparse embedding | BM25/IDF — also computed server-side by Qdrant Cloud |
+| Retrieval | RRF fusion of the dense + sparse results (`pipeline/query_engines.py::EnglishPivotQueryEngine`) |
 
-| Strategy | What gets embedded | Use case |
-|---|---|---|
-| `passage` | Full vernacular passage | Baseline, good recall |
-| `sentence` | Individual sentences | High precision + small-to-big expansion |
-| `qa_pair` | English query + vernacular passage | In-distribution query bias |
-| `english_query` | English question only | English-pivot; all 14 langs, one model |
-
-See [CHUNKING.md](./CHUNKING.md) for detailed strategy documentation.
-
-### Embedding Backends
-
-| Backend | Model | Dim | Notes |
-|---|---|---|---|
-| `e5` | `intfloat/multilingual-e5-small` | 384 | Local, all 14 languages, asymmetric prefix |
-| `english` | `sentence-transformers/all-MiniLM-L6-v2` | 384 | Local, English only, symmetric |
-| `cohere` | `Cohere/embed-multilingual-v3.0` | 1024 | API, best recall, rate-limited (2000 inputs/min) |
+See [CHUNKING.md](./CHUNKING.md) for the full rationale, including the other
+chunking strategies and embedding backends (vernacular passage/sentence/qa_pair
+chunking; local e5; Cohere API) that were prototyped and evaluated before this
+single-strategy, Qdrant-Cloud-inference-only architecture was chosen.
 
 ### Registry
 
@@ -79,28 +72,26 @@ See [CHUNKING.md](./CHUNKING.md) for detailed strategy documentation.
 
 ```bash
 uv sync
-# Qdrant: either local (default, no env vars needed)...
+# Qdrant: either local (fallback, no env vars needed, local-only dev)...
 docker run -p 6333:6333 qdrant/qdrant
 # ...or a Qdrant Cloud cluster — set QDRANT_CLUSTER_ENDPOINT + QDRANT_API_KEY
-# in .env instead; also switches MiniLM/BM25 embedding to server-side
-# inference (see INDEXING.md).
+# in .env instead. Required for the embedding to actually work: Qdrant Cloud's
+# server-side inference is the only embedding mechanism now (see INDEXING.md).
 ```
 
 Environment variables:
 ```
 SARVAM_API_KEY=...
-COHERE_API_KEY=...              # optional; enables cohere backend
-QDRANT_CLUSTER_ENDPOINT=...     # optional; Qdrant Cloud cluster URL — falls back to http://localhost:6333 if unset
-QDRANT_API_KEY=...              # optional; presence also enables Qdrant Cloud server-side inference
-                                 # (MiniLM + BM25 embedding computed remotely instead of locally — see INDEXING.md)
+QDRANT_CLUSTER_ENDPOINT=...     # Qdrant Cloud cluster URL — falls back to http://localhost:6333 if unset
+QDRANT_API_KEY=...              # required for embeddings to work at all (server-side MiniLM+BM25 inference)
 ```
 
 ### Index a language
 
-Indexing is CLI-only — see `INDEXING.md` for the full reference (multi-language, parallel workers, resuming, English-pivot/RRF, migrations).
+Indexing is CLI-only — see `INDEXING.md` for the full reference (multi-language, parallel workers, resuming).
 
 ```bash
-uv run python -m scripts.index --langs hi --backend english --chunkers english_query
+uv run python -m scripts.index --langs hi
 ```
 
 ### Start the API + Admin UI
@@ -141,16 +132,14 @@ GET  /health         → { "status": "ok"|"degraded", "plans": [...] }
 ```
 pipeline/
   index_plan.py    — IndexPlan dataclass + registry CRUD + sync_registry_with_qdrant
-  embedder.py      — three backends + device auto-selection (mps/cuda/cpu), rate limiter for Cohere
-  chunking.py      — PassageChunker, SentenceChunker, QAPairChunker, EnglishQueryChunker
-  indexer.py       — ensure_collection, index_language, run_indexing, get_vectorstore (import-only, see scripts/index.py)
+  chunking.py      — EnglishQueryChunker (the one supported chunker)
+  indexer.py       — ensure_collection, index_language, run_indexing (import-only, see scripts/index.py)
   rag.py           — RAGChain: guardrails + retrieve (via query_engines) + generate
-  query_engines.py — BaseQueryEngine / VernacularQueryEngine / EnglishPivotQueryEngine (RRF hybrid)
-  lc_embedder.py   — LangChain Embeddings wrapper for all backends
+  query_engines.py — EnglishPivotQueryEngine (RRF hybrid, Qdrant Cloud server-side inference)
+  guardrails.py    — LLM-based input check + lexical-overlap grounding check (no embedding calls)
 
 scripts/
   index.py         — the indexing CLI entrypoint (see INDEXING.md)
-  migrate_bm25.py  — one-time sparse-vector migration for pre-RRF english_query collections
 
 api/
   app.py           — FastAPI app, /plans, /health
