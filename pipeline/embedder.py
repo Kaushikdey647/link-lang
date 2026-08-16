@@ -76,13 +76,29 @@ _limiter = _TokenBucket(_COHERE_RATE, _COHERE_BURST) if _COHERE_KEY else None
 _e5_model = None
 _minilm_model = None
 _cohere_embeddings = None
+_device: str | None = None
+
+
+def _best_device() -> str:
+    """sentence-transformers only auto-detects CUDA, not Apple's MPS — without
+    this, local embedding silently runs on CPU on Apple Silicon."""
+    global _device
+    if _device is None:
+        import torch
+        if torch.backends.mps.is_available():
+            _device = "mps"
+        elif torch.cuda.is_available():
+            _device = "cuda"
+        else:
+            _device = "cpu"
+    return _device
 
 
 def _get_e5():
     global _e5_model
     if _e5_model is None:
         from sentence_transformers import SentenceTransformer
-        _e5_model = SentenceTransformer("intfloat/multilingual-e5-small")
+        _e5_model = SentenceTransformer("intfloat/multilingual-e5-small", device=_best_device())
     return _e5_model
 
 
@@ -90,7 +106,7 @@ def _get_minilm():
     global _minilm_model
     if _minilm_model is None:
         from sentence_transformers import SentenceTransformer
-        _minilm_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        _minilm_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device=_best_device())
     return _minilm_model
 
 

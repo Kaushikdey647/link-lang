@@ -15,7 +15,7 @@ Usage:
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import Counter, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 from fastapi import FastAPI
 
@@ -86,34 +86,6 @@ PASSAGES_RETRIEVED = Histogram(
     ["lang"],
     buckets=(1, 2, 3, 4, 5, 8, 10, 20),
 )
-
-# ---------------------------------------------------------------------------
-# Ingestion gauges — updated by the indexing worker in ui/indexing.py
-# ---------------------------------------------------------------------------
-
-INDEXING_RUNNING = Gauge(
-    "indexing_running",
-    "1 if an indexing job is active, 0 otherwise",
-)
-
-INDEXING_CHUNKS_DONE = Gauge(
-    "indexing_chunks_done",
-    "Chunks upserted into Qdrant in the current/last run",
-    ["lang", "split"],
-)
-
-INDEXING_CHUNKS_TARGET = Gauge(
-    "indexing_chunks_target",
-    "Estimated total chunks for the current/last run",
-    ["lang", "split"],
-)
-
-INDEXING_THROUGHPUT = Gauge(
-    "indexing_throughput_chunks_per_min",
-    "Rolling chunk throughput for the active indexing run",
-    ["lang", "split"],
-)
-
 
 # ---------------------------------------------------------------------------
 # Convenience recorder — call this at the end of every RAG invoke()

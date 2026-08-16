@@ -9,9 +9,14 @@ interface Props {
   transcript?: string;
   answer: string;
   passages: Passage[];
+  totalMs?: number;
 }
 
-export default function AnswerDisplay({ transcript, answer, passages }: Props) {
+function fmtDuration(ms: number): string {
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+export default function AnswerDisplay({ transcript, answer, passages, totalMs }: Props) {
   const [showSources, setShowSources] = useState(false);
 
   return (
@@ -33,16 +38,25 @@ export default function AnswerDisplay({ transcript, answer, passages }: Props) {
         <p className="text-white/90 text-base leading-relaxed whitespace-pre-wrap">{answer}</p>
       </div>
 
-      {/* Sources toggle */}
-      {passages.length > 0 && (
+      {/* Timing + sources toggle */}
+      {(totalMs !== undefined || passages.length > 0) && (
         <div>
-          <button
-            onClick={() => setShowSources((s) => !s)}
-            className="flex items-center gap-1.5 text-xs text-white/30 hover:text-white/60 transition-colors mx-auto"
-          >
-            {showSources ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-            {passages.length} source{passages.length !== 1 ? "s" : ""}
-          </button>
+          <div className="flex items-center justify-center gap-3">
+            {totalMs !== undefined && (
+              <span className="text-xs text-white/25 font-mono tracking-wide">
+                {fmtDuration(totalMs)}
+              </span>
+            )}
+            {passages.length > 0 && (
+              <button
+                onClick={() => setShowSources((s) => !s)}
+                className="flex items-center gap-1.5 text-xs text-white/30 hover:text-white/60 transition-colors"
+              >
+                {showSources ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                {passages.length} source{passages.length !== 1 ? "s" : ""}
+              </button>
+            )}
+          </div>
 
           {showSources && (
             <motion.div

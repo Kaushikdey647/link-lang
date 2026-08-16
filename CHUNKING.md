@@ -50,7 +50,7 @@ This means the passages **are** the natural chunk boundary. We don't re-chunk ac
 
 ---
 
-## Three Chunking Strategies
+## Four Chunking Strategies
 
 All strategies share a unified interface:
 
@@ -175,6 +175,44 @@ text:       "मैनहट्टन परियोजना की सफल�
 
 ---
 
+### Strategy 4 — English Query (`EnglishQueryChunker`)
+
+**The English-pivot idea:** MSMARCO-XI contains both the original English question (`record.eng_query`) and its translated vernacular passage (`record.text`). Instead of embedding the vernacular passage, we embed the *English question* using a lightweight English sentence model. At query time, the user's vernacular voice query is translated to English before embedding — giving us cross-lingual retrieval with a single monolingual model.
+
+Note: `record.query` is the *vernacular* translation of the question (same language as `record.text`) — it's `record.eng_query` that always holds the original English, independent of the `translated` flag `iter_passages()` was called with.
+
+**Why:** A good English embedding model covers a much smaller vocabulary than a multilingual model. `all-MiniLM-L6-v2` (22M params) outperforms `multilingual-e5-small` (117M params) on English-only retrieval benchmarks while running 3× faster. Since the original MSMARCO questions are high-quality English, and Sarvam's translate API can convert user queries to English in ~50ms, this gives us the best of both worlds: English model quality + vernacular UI.
+
+**What gets embedded:** `record.eng_query` (English question — clean, concise, already high quality)
+
+**What gets returned:** `record.text` (vernacular passage — stored in `parent_passage` field, returned as LLM context)
+
+**Same input passage** (`is_selected = True`) → **1 english_query chunk:**
+
+```
+chunk_id:       "1185869_0__enq"
+chunk_type:     "english_query"
+text:           "what was the immediate impact of the success of the manhattan project?"   ← embedded
+parent_passage: "वैज्ञानिक दिमाग के बीच संचार की उपस्थिति मैनहट्टन परियोजना की सफलता..."  ← returned
+```
+
+**Query-time flow:**
+```
+User speaks (Hindi): "मैनहट्टन परियोजना में संचार की क्या भूमिका थी?"
+                              ↓  Sarvam translate (hi → en, ~50ms)
+Translated query:   "What was the role of communication in the Manhattan Project?"
+                              ↓  all-MiniLM-L6-v2 embed (~8ms)
+Vector search → top-k english_query chunks
+                              ↓  payload["parent_passage"]
+Context returned:   "वैज्ञानिक दिमाग के बीच संचार की उपस्थिति..."
+                              ↓  Sarvam-105B
+Answer (Hindi):     "संचार की भूमिका मैनहट्टन परियोजना में अत्यंत महत्वपूर्ण थी।"
+```
+
+Chunks are only emitted when `record.query` is non-empty (all `is_selected` passages have a query; `is_selected=False` passages skip QA chunk but still have `record.query` in the dataset — both get an `english_query` chunk).
+
+---
+
 ## Full Example: One Passage → All Chunks
 
 Starting from `passage_id = "1185869_0"` with `is_selected = True`:
@@ -187,26 +225,28 @@ Input:
   query      = "मैनहट्टन परियोजना की सफलता का तत्काल प्रभाव क्या था?"
   text       = "वैज्ञानिक दिमाग के बीच संचार... सैकड़ों हजारों निर्दोष जीवन का विनाश।"
 
-CompositeChunker output (5 chunks):
-┌──────────────────────────────┬────────────┬───────────────────────┐
-│ chunk_id                     │ chunk_type │ text (truncated)      │
-├──────────────────────────────┼────────────┼───────────────────────┤
-│ 1185869_0__passage           │ passage    │ वैज्ञानिक दिमाग...   │
-│ 1185869_0__sent_0            │ sentence   │ वैज्ञानिक दिमाग...   │
-│ 1185869_0__sent_1            │ sentence   │ परमाणु शोधकर्ताओं... │
-│ 1185869_0__sent_2            │ sentence   │ सैकड़ों हजारों...    │
-│ 1185869_0__qa                │ qa_pair    │ मैनहट्टन परियोजना... │
-└──────────────────────────────┴────────────┴───────────────────────┘
+CompositeChunker output — all strategies (6 chunks, is_selected=True):
+┌──────────────────────────────┬────────────────┬─────────────────────────────────────────────────┐
+│ chunk_id                     │ chunk_type     │ text field (what gets embedded)                 │
+├──────────────────────────────┼────────────────┼─────────────────────────────────────────────────┤
+│ 1185869_0__passage           │ passage        │ वैज्ञानिक दिमाग... (vernacular passage)         │
+│ 1185869_0__sent_0            │ sentence       │ वैज्ञानिक दिमाग... (first sentence)             │
+│ 1185869_0__sent_1            │ sentence       │ परमाणु शोधकर्ताओं... (second sentence)          │
+│ 1185869_0__sent_2            │ sentence       │ सैकड़ों हजारों... (third sentence)              │
+│ 1185869_0__qa                │ qa_pair        │ मैनहट्टन परियोजना? + वैज्ञानिक दिमाग...        │
+│ 1185869_0__enq               │ english_query  │ "what was the immediate impact..." (English!)   │
+└──────────────────────────────┴────────────────┴─────────────────────────────────────────────────┘
 
 For is_selected=False passages (9 out of 10 per row):
-┌──────────────────────────────┬────────────┐
-│ chunk_id                     │ chunk_type │
-├──────────────────────────────┼────────────┤
-│ 1185869_1__passage           │ passage    │
-│ 1185869_1__sent_0            │ sentence   │
-│ 1185869_1__sent_1            │ sentence   │
-│   (no qa_pair — not selected)│            │
-└──────────────────────────────┴────────────┘
+┌──────────────────────────────┬────────────────┐
+│ chunk_id                     │ chunk_type     │
+├──────────────────────────────┼────────────────┤
+│ 1185869_1__passage           │ passage        │
+│ 1185869_1__sent_0            │ sentence       │
+│ 1185869_1__sent_1            │ sentence       │
+│ 1185869_1__enq               │ english_query  │  ← still has English query; no qa_pair
+│  (no qa_pair — not selected) │                │
+└──────────────────────────────┴────────────────┘
 ```
 
 ---
@@ -282,7 +322,8 @@ At query time, the retriever can filter by `chunk_type` to change precision/reca
 | `["passage"]` | Fast, balanced. Good default. |
 | `["sentence"]` | Highest precision; expands to full passage via `passage_id` lookup. |
 | `["qa_pair"]` | Biased toward queries seen during indexing; good for in-distribution queries. |
-| `["passage", "sentence", "qa_pair"]` | Maximum recall; deduplication by `passage_id` keeps top-k clean. |
+| `["english_query"]` | Requires translate-to-English at query time; returns `parent_passage` as context. |
+| `["passage", "sentence", "qa_pair"]` | Maximum recall (vernacular embedding); deduplication by `passage_id` keeps top-k clean. |
 
 ```python
 from pipeline import retrieve
@@ -290,8 +331,8 @@ from pipeline import retrieve
 # Fast retrieval (passage only)
 results = retrieve(query, lang="hi", chunk_types=["passage"])
 
-# High-precision retrieval (sentence → expanded to passage)
-results = retrieve(query, lang="hi", chunk_types=["sentence"])
+# English-pivot: query translated to English, vernacular passage returned
+results = retrieve(query, lang="hi", chunk_types=["english_query"])
 
 # Default: all strategies, deduplicated
 results = retrieve(query, lang="hi")
@@ -301,15 +342,22 @@ results = retrieve(query, lang="hi")
 
 ## Embeddings
 
-### Model: `multilingual-e5-small`
+### Three Backends
 
-Every chunk's text is converted to a **384-dimensional float vector** using [`intfloat/multilingual-e5-small`](https://huggingface.co/intfloat/multilingual-e5-small). This model covers all 14 Indic languages in the dataset (Hindi, Bengali, Tamil, Telugu, etc.) plus English — a single model, no per-language switching.
+The embedding backend is configured independently of the chunking strategy via `IndexPlan`. Each backend creates its own Qdrant collection.
 
-**Why e5-small over other options:**
-- Sarvam does not offer an embedding API — their platform covers STT, chat, translation, and TTS only
-- OpenAI / Cohere embeddings add ~50ms network RTT and per-token cost at query time
-- e5-small runs on CPU in ~25ms locally — well within the 200ms retrieval budget
-- "small" (117M params) is the right size: larger e5 variants improve recall by ~1-2% but double latency
+| Backend | Model | Dim | Prefix | Language support | Cost |
+|---|---|---|---|---|---|
+| `e5` | `intfloat/multilingual-e5-small` | 384 | `passage:` / `query:` | All 14 Indic + English | Local, free |
+| `english` | `sentence-transformers/all-MiniLM-L6-v2` | 384 | None (symmetric) | English only | Local, free |
+| `cohere` | `Cohere/embed-multilingual-v3.0` | 1024 | Input type flag | 100+ languages | API, ~$0.10/1M tokens |
+
+**When to use which backend:**
+- `e5` — default for vernacular chunking strategies (`passage`, `sentence`, `qa_pair`); no API dependency
+- `english` — use with `english_query` chunks; faster, smaller model, English-only data embeds well here
+- `cohere` — best recall for mixed-language or high-stakes deployments; requires `COHERE_API_KEY`
+
+The `english` backend with `english_query` chunker is the recommended production setup: Sarvam translates queries to English (~50ms), and a small 22M-param model produces high-quality vectors, with vernacular passages returned via `parent_passage`.
 
 ### The e5 Prefix Convention
 
@@ -320,15 +368,11 @@ Indexing time  →  "passage: <chunk text>"
 Query time     →  "query: <user question>"
 ```
 
-Without the prefix, cosine similarity degrades significantly. Our `embedder.py` handles this automatically:
+Without the prefix, cosine similarity degrades significantly. `embedder.py` handles this automatically. The `english` backend (all-MiniLM-L6-v2) is symmetric — no prefix needed.
 
-```python
-def embed_passages(texts):          # called by indexer
-    return model.encode(["passage: " + t for t in texts])
+### Cohere Rate Limiter
 
-def embed_query(text):              # called by retriever
-    return model.encode(["query: " + text])
-```
+Cohere's embed API has a 2,000-input/minute limit on free-tier keys. `embedder.py` implements a thread-safe token bucket (33 inputs/sec, 200-burst capacity) that counts individual texts, not batch requests. This allows full parallelism up to the limit without explicit sleep calls.
 
 ### Each Chunk Gets Its Own Vector
 
@@ -351,14 +395,38 @@ The sentence chunks and passage chunk are **similar but not identical** — the 
 
 ---
 
+## IndexPlan: Decoupled Indexing Strategy
+
+An `IndexPlan` ties together the backend (which model) and chunkers (what to embed) into a deterministic collection name:
+
+```python
+@dataclass
+class IndexPlan:
+    backend:  str          # "e5" | "english" | "cohere"
+    chunkers: list[str]    # e.g. ["passage", "sentence", "qa_pair"]
+    split:    str = "train"
+
+    @property
+    def collection_name(self) -> str:
+        key = "_".join(sorted(self.chunkers))   # sorted → always deterministic
+        return f"msmarco_xi__{self.backend}__{key}__{self.split}"
+```
+
+Example collection names:
+- `msmarco_xi__english__english_query__train` — English-pivot, all-MiniLM
+- `msmarco_xi__e5__passage_sentence_qa_pair__train` — full vernacular strategy, e5
+- `msmarco_xi__cohere__passage__train` — passage-only, Cohere
+
+A registry at `.indexer_checkpoints/registry.json` records every successfully indexed plan with its model metadata. The query layer calls `best_available_plan()` to pick from what's available (preference: cohere > english > e5), or the caller can specify a `collection` name explicitly.
+
 ## Qdrant: Storage and Retrieval
 
 ### Collection Structure
 
-All chunks across all languages land in a single Qdrant collection `msmarco_xi`. Language is a payload field, not a separate collection — this lets you do cross-lingual retrieval later if needed.
+Each `IndexPlan` gets its own Qdrant collection. Language is a payload field within each collection — all 14 languages share one collection per plan.
 
 ```
-Collection: msmarco_xi
+Collection: msmarco_xi__english__english_query__train
   Vector size:  384  (cosine distance)
   Payload indexes:
     lang        → KEYWORD   (filter by language at query time)
@@ -419,7 +487,39 @@ This two-step lookup adds ~2ms and gives the LLM the full context around the mat
 
 ## End-to-End RAG Pipeline
 
-### Component Map
+Two query paths depending on the active `IndexPlan`:
+
+### Path A — Vernacular embedding (e5 / cohere backend)
+
+```
+User speaks (Hindi) → Sarvam STT → vernacular query text
+                                          ↓
+                           embed_query("query: <text>", backend="e5")
+                                          ↓
+                     Qdrant ANN (filter: lang=hi, chunk_type=[...])
+                                          ↓
+                     sentence hits → scroll → parent passage expansion
+                                          ↓
+                           Sarvam-105B → answer in Hindi
+```
+
+### Path B — English-pivot (english backend + english_query chunker)
+
+```
+User speaks (Hindi) → Sarvam STT → vernacular query text
+                                          ↓
+                         Sarvam translate (hi → en, ~50ms)
+                                          ↓
+                           embed_query(english_text, backend="english")
+                                          ↓
+                     Qdrant ANN (filter: lang=hi, chunk_type=english_query)
+                                          ↓
+                     payload["parent_passage"] → vernacular passage context
+                                          ↓
+                           Sarvam-105B → answer in Hindi
+```
+
+### Detailed Component Map (Path A)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -485,18 +585,19 @@ A general-purpose model like GPT-4o would need to "think" in English and transla
 The 200ms target from the problem statement applies to the **retrieval sub-pipeline** (embed + Qdrant). Full end-to-end including generation is longer:
 
 ```
-Step                          Target      Notes
-──────────────────────────────────────────────────────────────────
-STT (Sarvam Saaras v3)        ~1-3s       Network + model inference
-Embed query (e5-small local)   ~25ms      CPU, single vector
-Qdrant ANN search              ~15ms      HNSW index, payload filter
-Small-to-big scroll            ~2ms       Only on sentence hits
-                              ──────
-Retrieval subtotal             ~42ms      ✓ well under 200ms
+Step                               Path A (e5)   Path B (english-pivot)   Notes
+────────────────────────────────────────────────────────────────────────────────
+STT (Sarvam Saaras v3)             ~1-3s         ~1-3s                    Network + model inference
+Sarvam translate (hi → en)         —             ~50ms                    Only in english-pivot path
+Embed query (local)                ~25ms         ~8ms                     e5-small vs all-MiniLM
+Qdrant ANN search                  ~15ms         ~15ms                    HNSW index, payload filter
+Small-to-big scroll / parent_pass  ~2ms          ~0ms (payload field)     parent_passage already in payload
+                                   ──────        ──────
+Retrieval subtotal                 ~42ms         ~73ms                    ✓ well under 200ms (both paths)
 
-Sarvam-105B generation         ~3-8s      Reasoning model (CoT)
-                              ──────
-Full pipeline                  ~5-12s     STT + retrieval + generation
+Sarvam-105B generation             ~3-8s         ~3-8s                    Reasoning model (CoT)
+                                   ──────        ──────
+Full pipeline                      ~5-12s        ~5-12s                   STT + retrieval + generation
 ```
 
-The retrieval stage meets 200ms comfortably. Generation latency is dominated by sarvam-105b's reasoning phase — unavoidable with the only available Sarvam chat model. Setting `reasoning_effort="low"` keeps this closer to 3s than 8s.
+The retrieval stage meets 200ms comfortably on both paths. Generation latency is dominated by sarvam-105b's reasoning phase. Setting `reasoning_effort="low"` keeps this closer to 3s than 8s.

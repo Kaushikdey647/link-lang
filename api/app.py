@@ -22,7 +22,7 @@ from ui.admin_app import build_admin_ui
 import gradio as gr
 
 app = FastAPI(
-    title="Link-Lang RAG API",
+    title="Bhasha RAG API",
     description="Voice-enabled multilingual RAG over MSMARCO-XI (Sarvam + Qdrant)",
     version="0.1.0",
 )

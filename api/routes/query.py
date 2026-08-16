@@ -38,9 +38,14 @@ def query(req: QueryRequest) -> QueryResponse:
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="query must not be empty")
 
-    lang  = req.lang or identify_language(req.query)
-    chain = _get_chain(lang, req.collection, req.chunk_types)
-    result = chain.invoke(req.query)
+    lang = req.lang or identify_language(req.query)
+    try:
+        chain = _get_chain(lang, req.collection, req.chunk_types)
+        result = chain.invoke(req.query)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Query pipeline unavailable: {e}")
     record_rag_result(result, lang=lang, endpoint="text")
 
     return QueryResponse(

@@ -19,7 +19,7 @@ Safe to re-run: if the collection already has the sparse vector space,
 this is a no-op.
 
 Usage:
-    python -m scripts.migrate_bm25 --collection msmarco_xi__english__english_query__train
+    uv run python -m scripts.migrate_bm25 --collection msmarco_xi__english__english_query__train
 """
 
 from __future__ import annotations

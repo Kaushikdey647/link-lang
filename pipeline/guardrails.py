@@ -46,11 +46,20 @@ _domain_centroid: np.ndarray | None = None
 def set_domain_centroid(passage_texts: list[str]) -> None:
     """Pre-compute and cache the domain centroid from a representative sample."""
     global _domain_centroid
-    vecs = embed_passages(passage_texts)
+    vecs = np.array(embed_passages(passage_texts))
     _domain_centroid = vecs.mean(axis=0)
     norm = np.linalg.norm(_domain_centroid)
     if norm > 0:
         _domain_centroid /= norm
+
+
+def ensure_domain_centroid(sample_texts: list[str]) -> None:
+    """Idempotent entry point: sets the domain centroid on first call only, so
+    repeated RAGChain construction (or multiple languages sharing a process)
+    doesn't re-embed a sample every time. No-ops if sample_texts is empty."""
+    if _domain_centroid is not None or not sample_texts:
+        return
+    set_domain_centroid(sample_texts)
 
 
 def check_input(query: str) -> GuardrailResult:
@@ -116,11 +125,11 @@ def check_grounding(answer: str, passage_texts: list[str]) -> GuardrailResult:
     if not sentences:
         return GuardrailResult(passed=True, reason="")
 
-    passage_vecs = embed_passages(passage_texts)
+    passage_vecs = np.array(embed_passages(passage_texts))
     ungrounded = 0
 
     for sentence in sentences:
-        s_vec = embed_query(sentence)
+        s_vec = np.array(embed_query(sentence))
         sims = passage_vecs @ s_vec
         if float(sims.max()) < _GROUNDING_THRESHOLD:
             ungrounded += 1

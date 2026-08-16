@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Link-Lang",
+  title: "Bhasha",
   description: "Voice-enabled multilingual RAG over MS MARCO-XI",
 };
 

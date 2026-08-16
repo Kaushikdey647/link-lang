@@ -24,6 +24,8 @@ from __future__ import annotations
 import os
 from abc import ABC, abstractmethod
 
+import truststore; truststore.inject_into_ssl()
+from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
@@ -34,6 +36,8 @@ from qdrant_client.models import (
 
 from pipeline.embedder import embed_query
 from pipeline.index_plan import IndexPlan
+
+load_dotenv()
 
 # BCP-47 codes for Sarvam translate API
 _SARVAM_LANG: dict[str, str] = {
@@ -47,7 +51,7 @@ _SARVAM_LANG: dict[str, str] = {
 def _translate_to_english(text: str, lang: str) -> str:
     """Translate a vernacular query to English via Sarvam translate API."""
     from sarvamai import SarvamAI
-    client = SarvamAI(api_key=os.environ.get("SARVAM_API_KEY", ""))
+    client = SarvamAI(api_subscription_key=os.environ.get("SARVAM_API_KEY", ""))
     r = client.text.translate(
         input=text,
         source_language_code=_SARVAM_LANG.get(lang, "auto"),

@@ -18,6 +18,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from qdrant_client import QdrantClient
+from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+from constants import LANG_CODE_MAP
 from pipeline.chunking import REGISTRY
 from pipeline.embedder import AVAILABLE_BACKENDS, VECTOR_DIM_FOR
 
@@ -223,6 +227,53 @@ def best_available_plan() -> Optional[IndexPlan]:
 
     best_entry = max(registry.values(), key=_rank)
     return IndexPlan.from_dict(best_entry)
+
+
+# ---------------------------------------------------------------------------
+# Registry <-> Qdrant reconciliation (used by the CLI after each language
+# completes, and by the read-only Ingestion tab on refresh — moved here from
+# ui/indexing.py so both can share it without either depending on the UI).
+# ---------------------------------------------------------------------------
+
+_LEGACY_COLLECTION_DEFAULTS: dict[str, dict] = {
+    "msmarco_xi_e5": {"backend": "e5", "chunkers": ["passage", "sentence", "qa_pair"], "split": "train"},
+}
+
+
+def sync_registry_with_qdrant(client: QdrantClient) -> None:
+    """Reconcile registry.json against what's actually in Qdrant: drop entries
+    whose collection no longer exists (e.g. deleted/recreated outside the app,
+    which would otherwise show as a permanent ghost entry), and auto-register
+    known legacy collections that exist but aren't registered yet."""
+    registry = load_registry()
+    to_check = {n: d for n, d in _LEGACY_COLLECTION_DEFAULTS.items() if n not in registry}
+    if not registry and not to_check:
+        return
+    try:
+        existing = {c.name for c in client.get_collections().collections}
+    except Exception:
+        return
+
+    prune_missing_collections(existing)
+
+    for name, defaults in to_check.items():
+        if name not in existing:
+            continue
+        lang_counts = {}
+        for code in LANG_CODE_MAP:
+            try:
+                r = client.count(
+                    collection_name=name,
+                    count_filter=Filter(must=[
+                        FieldCondition(key="metadata.lang", match=MatchValue(value=code))
+                    ]),
+                    exact=False,
+                )
+                if r.count > 0:
+                    lang_counts[code] = r.count
+            except Exception:
+                continue
+        register_legacy_collection(name, lang_counts=lang_counts, **defaults)
 
 
 def all_plans() -> list[IndexPlan]:

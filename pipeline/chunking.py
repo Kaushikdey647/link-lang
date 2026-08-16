@@ -145,16 +145,16 @@ class QAPairChunker(BaseChunker):
 class EnglishQueryChunker(BaseChunker):
     """One chunk per record: text = English question (embedded), parent_passage = vernacular passage (returned).
 
-    Use with the "english" embedding backend. Requires record.query to be non-empty
-    (always true for MSMARCO-XI translated records).
+    Use with the "english" embedding backend. Requires record.eng_query to be non-empty
+    (always true for MSMARCO-XI records — Eng_Query is populated regardless of `translated`).
     """
 
     def chunk(self, record: PassageRecord) -> list[Chunk]:
-        if not record.query:
+        if not record.eng_query:
             return []
         return [Chunk(
             chunk_id=f"{record.passage_id}__enq",
-            text=record.query,          # English question → embedded
+            text=record.eng_query,      # English question → embedded
             chunk_type="english_query",
             parent_passage=record.text, # vernacular passage → returned as context
             **_base(record),

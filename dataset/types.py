@@ -9,9 +9,10 @@ class PassageRecord:
     text: str
     lang: str             # 2-letter code: "hi", "bn", …
     is_selected: bool     # ground-truth relevance label
-    query: str            # associated query (same language as text)
+    query: str            # associated query (same language as text; follows `translated`)
     answer: str           # associated answer (same language as text)
     query_type: str       # e.g. "DESCRIPTION", "NUMERIC", …
+    eng_query: str = ""   # the English question, always — independent of `translated`
 
 
 @dataclass

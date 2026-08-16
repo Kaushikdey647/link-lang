@@ -36,8 +36,13 @@ async def voice_query(
     if not transcript.strip():
         raise HTTPException(status_code=422, detail="STT returned empty transcript.")
 
-    chain = _get_chain(lang, collection)
-    result = chain.invoke(transcript)
+    try:
+        chain = _get_chain(lang, collection)
+        result = chain.invoke(transcript)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Query pipeline unavailable: {e}")
     record_rag_result(result, lang=lang, endpoint="voice")
 
     return VoiceQueryResponse(

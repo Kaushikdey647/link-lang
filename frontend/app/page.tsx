@@ -24,6 +24,7 @@ interface Result {
   detectedLang?: string;
   answer: string;
   passages: Passage[];
+  totalMs: number;
 }
 
 const _fade = {
@@ -59,6 +60,7 @@ export default function Home() {
 
   const handleVoiceResult = useCallback(async (blob: Blob) => {
     setUiState("processing");
+    const t0 = performance.now();
     try {
       const res = await queryVoice(blob);
       setResult({
@@ -66,6 +68,7 @@ export default function Home() {
         detectedLang: res.detected_lang,
         answer: res.answer,
         passages: res.passages,
+        totalMs: performance.now() - t0,
       });
       setUiState("answered");
     } catch (e) {
@@ -111,9 +114,10 @@ export default function Home() {
     setShowText(false);
     setUiState("processing");
     setResult(null);
+    const t0 = performance.now();
     try {
       const res = await queryText(text);
-      setResult({ answer: res.answer, passages: res.passages });
+      setResult({ answer: res.answer, passages: res.passages, totalMs: performance.now() - t0 });
       setUiState("answered");
     } catch (e) {
       setErrorMsg(String(e));
@@ -139,7 +143,7 @@ export default function Home() {
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="relative z-10 flex items-center justify-between px-6 pt-8 pb-2">
         <div className="flex flex-col gap-1">
-          <span className="text-xs text-white/30 tracking-[0.2em] uppercase">Link-Lang</span>
+          <span className="text-xs text-white/30 tracking-[0.2em] uppercase">Bhasha</span>
           <div className="flex items-center gap-1.5">
             <span className="text-sm font-medium text-white/70 tracking-tight">Voice AI</span>
             <span
@@ -217,6 +221,7 @@ export default function Home() {
                 transcript={result.transcript}
                 answer={result.answer}
                 passages={result.passages}
+                totalMs={result.totalMs}
               />
             </motion.div>
           )}

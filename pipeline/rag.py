@@ -25,9 +25,10 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_qdrant import QdrantVectorStore
 from langchain_sarvam import ChatSarvam
 from qdrant_client import QdrantClient
+from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from pipeline.embedder import DEFAULT_BACKEND
-from pipeline.guardrails import GuardrailResult, check_grounding, check_input
+from pipeline.guardrails import GuardrailResult, check_grounding, check_input, ensure_domain_centroid
 from pipeline.index_plan import IndexPlan, best_available_plan
 from pipeline.indexer import QDRANT_URL, get_vectorstore
 from pipeline.query_engines import build_query_engine
@@ -66,6 +67,27 @@ class RAGResponse:
     error: str = ""
 
 
+def _sample_domain_texts(client: QdrantClient, collection: str, lang: str, limit: int = 250) -> list[str]:
+    """Small sample of already-indexed passage text, used once to seed the
+    off-topic guardrail's domain centroid (pipeline/guardrails.py). Falls back
+    to an unfiltered sample if nothing matches `lang` yet."""
+    try:
+        points, _ = client.scroll(
+            collection_name=collection,
+            scroll_filter=Filter(must=[FieldCondition(key="metadata.lang", match=MatchValue(value=lang))]),
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        if not points:
+            points, _ = client.scroll(
+                collection_name=collection, limit=limit, with_payload=True, with_vectors=False,
+            )
+        return [p.payload["page_content"] for p in points if p.payload.get("page_content")]
+    except Exception:
+        return []
+
+
 class RAGChain:
     """Harness wrapping retrieval + Sarvam-105B generation with guardrails.
 
@@ -99,6 +121,7 @@ class RAGChain:
 
         self._vectorstore: QdrantVectorStore = get_vectorstore(self.plan)
         self._qdrant_client = QdrantClient(url=QDRANT_URL)
+        ensure_domain_centroid(_sample_domain_texts(self._qdrant_client, self.plan.collection_name, self.lang))
         self._engine = build_query_engine(
             self.plan,
             vectorstore=self._vectorstore,
@@ -125,9 +148,13 @@ class RAGChain:
     def invoke(self, query: str) -> RAGResponse:
         latency: dict[str, float] = {}
 
-        # 1. Input guardrail
+        # 1. Input guardrail — fails closed (rejects) rather than propagating,
+        # since an unhandled error here would otherwise skip safety screening entirely.
         t0 = time.perf_counter()
-        input_result = check_input(query)
+        try:
+            input_result = check_input(query)
+        except Exception as e:
+            input_result = GuardrailResult(passed=False, reason=f"Input guardrail check failed: {e}")
         latency["input_guardrail_ms"] = (time.perf_counter() - t0) * 1000
 
         if not input_result.passed:
@@ -141,7 +168,19 @@ class RAGChain:
 
         # 2. Retrieval
         t0 = time.perf_counter()
-        docs = self._retrieve(query, self.lang)
+        try:
+            docs = self._retrieve(query, self.lang)
+        except Exception as e:
+            latency["retrieval_ms"] = (time.perf_counter() - t0) * 1000
+            latency["total_ms"] = sum(latency.values())
+            return RAGResponse(
+                answer="I ran into an error trying to retrieve context for this question — please try again.",
+                passages=[],
+                input_guardrail=input_result,
+                grounding_guardrail=GuardrailResult(passed=False, reason="Retrieval failed."),
+                latency=latency,
+                error=f"retrieval_error: {e}",
+            )
         latency["retrieval_ms"] = (time.perf_counter() - t0) * 1000
 
         if not docs:
@@ -157,13 +196,30 @@ class RAGChain:
         context = self._format_context(docs)
         lang_name = _LANG_NAMES.get(self.lang, self.lang)
         t0 = time.perf_counter()
-        answer = self._chain.invoke({"context": context, "question": query, "lang_name": lang_name})
+        try:
+            answer = self._chain.invoke({"context": context, "question": query, "lang_name": lang_name})
+        except Exception as e:
+            latency["generation_ms"] = (time.perf_counter() - t0) * 1000
+            latency["total_ms"] = sum(latency.values())
+            return RAGResponse(
+                answer="I ran into an error trying to generate an answer for this question — please try again.",
+                passages=[{"text": d.page_content, **d.metadata} for d in docs],
+                input_guardrail=input_result,
+                grounding_guardrail=GuardrailResult(passed=False, reason="Generation failed."),
+                latency=latency,
+                error=f"generation_error: {e}",
+            )
         latency["generation_ms"] = (time.perf_counter() - t0) * 1000
 
-        # 4. Grounding guardrail — check against the full parent texts used for generation
+        # 4. Grounding guardrail — check against the full parent texts used for generation.
+        # Fails closed (treated as ungrounded) rather than propagating, so a
+        # transient embedding error doesn't discard an already-generated answer.
         t0 = time.perf_counter()
         passage_texts = [d.metadata.get("parent_passage") or d.page_content for d in docs]
-        grounding_result = check_grounding(answer, passage_texts)
+        try:
+            grounding_result = check_grounding(answer, passage_texts)
+        except Exception as e:
+            grounding_result = GuardrailResult(passed=False, reason=f"Grounding check failed: {e}")
         latency["grounding_guardrail_ms"] = (time.perf_counter() - t0) * 1000
 
         if not grounding_result.passed:
@@ -189,6 +245,13 @@ class RAGChain:
     def _retrieve(self, query: str, lang: str) -> list[Document]:
         """Delegates to this plan's query engine (pipeline/query_engines.py)."""
         return self._engine.retrieve(query, lang, self.top_k)
+
+    def retrieve_only(self, query: str) -> list[Document]:
+        """Run just the retrieval sub-pipeline (embed + Qdrant ANN, plus
+        translation for the english-pivot plan) — the piece PROBLEM-STATEMENT.md's
+        <200ms latency target applies to. Skips guardrails/generation entirely.
+        Used by scripts/benchmark.py."""
+        return self._retrieve(query, self.lang)
 
     @staticmethod
     def _format_context(docs: list[Document]) -> str:

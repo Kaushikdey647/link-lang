@@ -19,18 +19,32 @@ def _get_client() -> SarvamAI:
     return _client
 
 
-def transcribe(audio_path: str | Path, language_code: str = "unknown") -> str:
-    """Transcribe an audio file, returning the transcript string.
+def transcribe(audio_path: str | Path) -> tuple[str, str]:
+    """Transcribe audio, auto-detecting language via saaras:v3.
 
-    Args:
-        audio_path: Path to audio file (WAV/MP3/OGG/FLAC/etc., best at 16kHz).
-        language_code: BCP-47 code e.g. "hi-IN", "ta-IN". "unknown" = auto-detect.
+    Returns:
+        (transcript, lang) where lang is a 2-letter ISO 639-1 code (e.g. "hi").
     """
     client = _get_client()
     with open(audio_path, "rb") as f:
         response = client.speech_to_text.transcribe(
             file=f,
             model="saaras:v3",
-            language_code=language_code,
+            language_code="unknown",   # triggers Sarvam LID
         )
-    return response.transcript
+    bcp47 = response.language_code or "hi-IN"
+    lang  = bcp47.split("-")[0]   # "hi-IN" → "hi"
+    return response.transcript, lang
+
+
+def identify_language(text: str) -> str:
+    """Detect the language of a text string.
+
+    Returns a 2-letter ISO 639-1 code; defaults to "hi" on failure.
+    """
+    try:
+        resp = _get_client().text.identify_language(input=text)
+        bcp47 = resp.language_code or "hi-IN"
+        return bcp47.split("-")[0]
+    except Exception:
+        return "hi"

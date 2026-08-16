@@ -51,19 +51,6 @@ def _sum_histogram_field(metric_name: str, suffix: str) -> float:
     return sum(s.value for s in _samples(metric_name) if s.name == full)
 
 
-def _sum_gauge(metric_name: str) -> float:
-    """Sum all samples of a Gauge across all label combinations."""
-    return sum(s.value for s in _samples(metric_name) if s.name == metric_name)
-
-
-def _get_gauge_scalar(metric_name: str) -> float:
-    """Return the single (unlabeled) value of a Gauge."""
-    for s in _samples(metric_name):
-        if s.name == metric_name:
-            return s.value
-    return 0.0
-
-
 # ---------------------------------------------------------------------------
 # Rolling store
 # ---------------------------------------------------------------------------
@@ -87,12 +74,6 @@ class _RollingStore:
         self._stt_sum:   deque[float] = deque(maxlen=_WINDOW)
         self._stt_cnt:   deque[float] = deque(maxlen=_WINDOW)
 
-        # --- Ingestion ---
-        self._idx_chunks: deque[float] = deque(maxlen=_WINDOW)
-        self._idx_target: deque[float] = deque(maxlen=_WINDOW)
-        self._idx_thru:   deque[float] = deque(maxlen=_WINDOW)
-        self._idx_run:    deque[float] = deque(maxlen=_WINDOW)  # 0 or 1
-
     # ── Public: sample ───────────────────────────────────────────────────────
 
     def tick(self) -> None:
@@ -109,11 +90,6 @@ class _RollingStore:
         stt_sum   = _sum_histogram_field("rag_stt_latency_seconds",        "_sum")
         stt_cnt   = _sum_histogram_field("rag_stt_latency_seconds",        "_count")
 
-        idx_chunks = _sum_gauge("indexing_chunks_done")
-        idx_target = _sum_gauge("indexing_chunks_target")
-        idx_thru   = _sum_gauge("indexing_throughput_chunks_per_min")
-        idx_run    = _get_gauge_scalar("indexing_running")
-
         with self._lock:
             self._times.append(now)
             self._req.append(req)
@@ -121,10 +97,6 @@ class _RollingStore:
             self._ret_sum.append(ret_sum);   self._ret_cnt.append(ret_cnt)
             self._gen_sum.append(gen_sum);   self._gen_cnt.append(gen_cnt)
             self._stt_sum.append(stt_sum);   self._stt_cnt.append(stt_cnt)
-            self._idx_chunks.append(idx_chunks)
-            self._idx_target.append(idx_target)
-            self._idx_thru.append(idx_thru)
-            self._idx_run.append(idx_run)
 
     # ── Public: scalar queries ────────────────────────────────────────────────
 
@@ -139,15 +111,6 @@ class _RollingStore:
         _cnts = {"pipeline": self._pipe_cnt, "retrieval": self._ret_cnt,
                  "generation": self._gen_cnt, "stt": self._stt_cnt}
         return self._histogram_mean(_sums[step], _cnts[step], window_s) * 1000
-
-    def indexing_throughput(self) -> float:
-        """Latest chunks/min reported by the indexing gauge."""
-        with self._lock:
-            return self._idx_thru[-1] if self._idx_thru else 0.0
-
-    def indexing_running(self) -> bool:
-        with self._lock:
-            return bool(self._idx_run[-1] > 0.5) if self._idx_run else False
 
     # ── Public: time-series for charts ───────────────────────────────────────
 
@@ -164,28 +127,6 @@ class _RollingStore:
         _cnts = {"pipeline": self._pipe_cnt, "retrieval": self._ret_cnt,
                  "generation": self._gen_cnt, "stt": self._stt_cnt}
         return self._mean_series(_sums[step], _cnts[step], window_s, scale=1000.0)
-
-    def indexing_series(
-        self, window_s: int = 300
-    ) -> tuple[list[float], list[float], list[float]]:
-        """(elapsed_s, chunks_done, throughput_chunks_per_min) over the window."""
-        with self._lock:
-            times  = list(self._times)
-            chunks = list(self._idx_chunks)
-            thru   = list(self._idx_thru)
-        if not times:
-            return [], [], []
-        now     = time.time()
-        cutoff  = now - window_s
-        triples = [(t, c, r) for t, c, r in zip(times, chunks, thru) if t >= cutoff]
-        if not triples:
-            return [], [], []
-        t0 = triples[0][0]
-        return (
-            [x[0] - t0 for x in triples],
-            [x[1] for x in triples],
-            [x[2] for x in triples],
-        )
 
     # ── Internals ────────────────────────────────────────────────────────────
 

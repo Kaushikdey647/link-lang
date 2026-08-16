@@ -1,11 +1,12 @@
-"""Prometheus metrics dashboard — Gradio tab.
+"""Serving metrics dashboard — Gradio tab.
 
-Three independent timers:
-  1s  → KPI markdown (serving + ingestion) + store.tick()
-  5s  → time-series line charts (QPS, latency, indexing throughput)
+Indexing is a separate CLI process now (pipeline/indexer.py) — this tab is
+serving-only, backed entirely by the in-process prometheus_client REGISTRY.
+
+Two independent timers:
+  1s  → KPI markdown + store.tick()
+  5s  → QPS/latency time-series
   15s → distribution charts (bar/histograms, per-lang breakdowns)
-
-All data comes from the in-process prometheus_client REGISTRY.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import numpy as np
 import gradio as gr
 from prometheus_client import REGISTRY
 
-from ui.metrics_store import store, _sum_counter, _sum_gauge, _sum_histogram_field
+from ui.metrics_store import store, _sum_counter, _sum_histogram_field
 from ui.theme import (
     BG as _BG, GRID as _GRID, TEXT as _TEXT, WHITE as _WHITE,
     INDIGO as _C1, CYAN as _C2, AMBER as _C3, RED as _C4, GREEN as _C5,
@@ -151,32 +152,10 @@ def _serving_kpi_md() -> str:
     )
 
 
-def _ingestion_kpi_md() -> str:
-    running  = store.indexing_running()
-    chunks   = _sum_gauge("indexing_chunks_done")
-    target   = _sum_gauge("indexing_chunks_target")
-    thru     = _sum_gauge("indexing_throughput_chunks_per_min")
-    progress = (chunks / target * 100) if target else 0
-    status   = "🟢 Running" if running else "⚫ Idle"
-    eta_str  = ""
-    if running and thru > 0 and target > chunks:
-        eta_min = (target - chunks) / thru
-        eta_str = f" &nbsp;·&nbsp; ETA ~{eta_min:.0f} min"
-    ts = datetime.now().strftime("%H:%M:%S")
-    return (
-        f"#### Ingestion &nbsp; <small>_updated {ts}_</small>\n\n"
-        f"| Metric | Value |\n|:---|---:|\n"
-        f"| Status | **{status}{eta_str}** |\n"
-        f"| Chunks Done | **{int(chunks):,}** / {int(target):,} |\n"
-        f"| Progress | **{progress:.1f}%** |\n"
-        f"| Throughput | **{thru:,.0f} chunks/min** |\n"
-    )
-
-
-def tick_kpis() -> tuple[str, str]:
+def tick_kpis() -> str:
     """1-second timer: sample the store AND return updated KPI markdown."""
     store.tick()
-    return _serving_kpi_md(), _ingestion_kpi_md()
+    return _serving_kpi_md()
 
 
 # ---------------------------------------------------------------------------
@@ -228,30 +207,8 @@ def build_latency_ts_chart() -> plt.Figure:
     return _tight(fig)
 
 
-def build_indexing_ts_chart() -> plt.Figure:
-    xs, chunks, thru = store.indexing_series(300)
-    fig, ax1 = _fig()
-    if xs and any(c > 0 for c in chunks):
-        ax1.fill_between(xs, chunks, alpha=0.12, color=_C1)
-        ax1.plot(xs, chunks, color=_C1, linewidth=1.5, label="Chunks")
-        ax1.set_ylabel("cumulative chunks", fontsize=7, color=_C1)
-        ax1.tick_params(axis="y", colors=_C1)
-        _fmt_elapsed(ax1, xs)
-        if any(t > 0 for t in thru):
-            ax2 = ax1.twinx()
-            ax2.set_facecolor(_BG)
-            ax2.plot(xs, thru, color=_C3, linewidth=1.2, linestyle="--", alpha=0.8)
-            ax2.set_ylabel("chunks/min", fontsize=7, color=_C3)
-            ax2.tick_params(axis="y", colors=_C3)
-            ax2.spines[["top", "right", "left", "bottom"]].set_color(_GRID)
-    else:
-        _no_data(ax1, "No indexing data yet")
-    ax1.set_title("Indexing Throughput (5 min)", fontsize=9, color=_WHITE, pad=6)
-    return _tight(fig)
-
-
-def refresh_timeseries() -> tuple[plt.Figure, plt.Figure, plt.Figure]:
-    return build_qps_chart(), build_latency_ts_chart(), build_indexing_ts_chart()
+def refresh_timeseries() -> tuple[plt.Figure, plt.Figure]:
+    return build_qps_chart(), build_latency_ts_chart()
 
 
 # ---------------------------------------------------------------------------
@@ -386,11 +343,11 @@ def refresh_distributions() -> tuple:
 # Tab builder
 # ---------------------------------------------------------------------------
 
-def build_metrics_tab() -> None:
-    """Render the metrics tab. Call inside a `with gr.Tab(...)` block."""
+def build_serving_tab() -> None:
+    """Render the Serving tab. Call inside a `with gr.Tab(...)` block."""
 
     gr.Markdown(
-        "Real-time Prometheus dashboard. "
+        "Real-time serving dashboard. "
         "KPIs refresh every **1 s**, time-series every **5 s**, "
         "distributions every **15 s**. "
         "Raw metrics at [`/metrics`](/metrics)."
@@ -398,9 +355,7 @@ def build_metrics_tab() -> None:
 
     # ── KPI row ───────────────────────────────────────────────────────────────
     with gr.Group():
-        with gr.Row():
-            serving_kpi  = gr.Markdown(value=_serving_kpi_md(),   min_height=0)
-            indexing_kpi = gr.Markdown(value=_ingestion_kpi_md(), min_height=0)
+        serving_kpi = gr.Markdown(value=_serving_kpi_md(), min_height=0)
 
     # ── Time-series ───────────────────────────────────────────────────────────
     gr.Markdown("### Time-series (5 s)")
@@ -408,8 +363,6 @@ def build_metrics_tab() -> None:
         with gr.Row():
             qps_plot     = gr.Plot(value=build_qps_chart(),        show_label=False)
             lat_ts_plot  = gr.Plot(value=build_latency_ts_chart(), show_label=False)
-        with gr.Row():
-            idx_ts_plot  = gr.Plot(value=build_indexing_ts_chart(), show_label=False)
 
     # ── Serving distributions ─────────────────────────────────────────────────
     gr.Markdown("### Serving Distributions (15 s)")
@@ -450,11 +403,11 @@ def build_metrics_tab() -> None:
 
     timer_1s.tick(
         fn=tick_kpis,
-        outputs=[serving_kpi, indexing_kpi],
+        outputs=[serving_kpi],
     )
     timer_5s.tick(
         fn=refresh_timeseries,
-        outputs=[qps_plot, lat_ts_plot, idx_ts_plot],
+        outputs=[qps_plot, lat_ts_plot],
     )
     timer_15s.tick(
         fn=refresh_distributions,
