@@ -15,10 +15,11 @@ Usage:
     uv run python -m scripts.index --langs hi bn
     uv run python -m scripts.index --langs all --workers 4
     uv run python -m scripts.index --langs hi --limit 5000   # quick test run
+    uv run python -m scripts.index --langs hi --strategy english_query
 
-Backend/chunker are no longer CLI flags — english-pivot (MiniLM dense + BM25
-sparse, both via Qdrant Cloud server-side inference) is the system's one
-supported strategy (see CHANGELOG.md).
+--strategy selects one of the two registered (backend, chunkers) plans (see
+pipeline/index_plan.py) — each is its own Qdrant collection, so switching
+strategies never touches the other collection's data.
 """
 
 from __future__ import annotations
@@ -29,10 +30,18 @@ from constants import LANG_CODE_MAP
 from pipeline.index_plan import IndexPlan
 from pipeline.indexer import run_indexing
 
+# strategy name -> (backend, chunker)
+STRATEGIES: dict[str, tuple[str, str]] = {
+    "english_query": ("english", "english_query"),
+    "qa_pair":        ("multilingual_e5_small", "qa_pair"),
+}
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--langs", nargs="+", default=["hi"],
                        help="Language codes to index, or 'all' for all 14")
+    parser.add_argument("--strategy", choices=list(STRATEGIES), default="qa_pair",
+                       help="Which (backend, chunker) plan to index into")
     parser.add_argument("--split",    default="train")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--workers", type=int, default=1,
@@ -42,5 +51,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     langs = list(LANG_CODE_MAP.keys()) if args.langs == ["all"] else args.langs
-    plan = IndexPlan(backend="english", chunkers=["english_query"], split=args.split)
+    backend, chunker = STRATEGIES[args.strategy]
+    plan = IndexPlan(backend=backend, chunkers=[chunker], split=args.split)
     run_indexing(langs, plan, args.batch_size, args.workers, args.limit)

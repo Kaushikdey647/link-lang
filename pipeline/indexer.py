@@ -62,6 +62,13 @@ QDRANT_CLOUD_INFERENCE = bool(QDRANT_API_KEY)
 # MODEL_NAME_FOR strings in pipeline/index_plan.py.
 MINILM_INFERENCE_MODEL = "sentence-transformers/all-minilm-l6-v2"
 BM25_INFERENCE_MODEL = "qdrant/bm25"
+E5_SMALL_INFERENCE_MODEL = "intfloat/multilingual-e5-small"
+
+# Which inference model backs each backend's dense vector.
+DENSE_INFERENCE_MODEL_FOR = {
+    "english": MINILM_INFERENCE_MODEL,
+    "multilingual_e5_small": E5_SMALL_INFERENCE_MODEL,
+}
 
 # qdrant-client defaults to a 5s request timeout, which large embed+upsert
 # batches (or a payload-index rebuild on a big collection) can exceed under
@@ -81,8 +88,9 @@ def _get_qdrant_client() -> QdrantClient:
 
 # ---------------------------------------------------------------------------
 # Sparse (BM25/IDF) vector space — computed server-side by Qdrant Cloud
-# (see MINILM_INFERENCE_MODEL/BM25_INFERENCE_MODEL above), used for RRF
-# hybrid retrieval (pipeline/query_engines.py:EnglishPivotQueryEngine).
+# (see MINILM_INFERENCE_MODEL/BM25_INFERENCE_MODEL above). Only used by the
+# optional `--strategy english_query` plan. Default/serving is dense-only
+# qa_pair + multilingual-e5-small (no BM25, no translate).
 # ---------------------------------------------------------------------------
 
 SPARSE_VECTOR_NAME = "bm25"
@@ -150,30 +158,51 @@ def _chunk_to_document(chunk: Chunk) -> Document:
     return Document(page_content=chunk.text, metadata=meta)
 
 
+def _e5_text(text: str) -> str:
+    # e5 models are trained with an asymmetric "query: "/"passage: " prefix
+    # convention — omitting it measurably hurts retrieval quality. qa_pair
+    # chunks are indexed (retrieval-target) documents, so "passage: " applies
+    # here; query-time embedding (frontend/lib/server/retrieval.ts) prefixes
+    # with "query: ".
+    return f"passage: {text}"
+
+
 def _upsert_batch(client: QdrantClient, plan: IndexPlan, chunks: list[Chunk]) -> None:
-    """Embed + upsert one batch via Qdrant Cloud server-side inference — dense
-    (MiniLM) and sparse (BM25) vectors are both computed remotely from raw
-    text in a single Qdrant round-trip; no local model inference at all.
-    Only english_query plans are supported (see CHANGELOG.md)."""
-    if "english_query" not in plan.chunkers:
-        raise NotImplementedError(
-            f"Unsupported chunkers {plan.chunkers!r} — only ['english_query'] is "
-            "supported for indexing now (see CHANGELOG.md)."
-        )
+    """Embed + upsert one batch via Qdrant Cloud server-side inference — all
+    vectors are computed remotely from raw text in a single Qdrant round-trip;
+    no local model inference at all. Only the two registered plans (see
+    pipeline/index_plan.py) are supported."""
     ids  = [str(uuid.uuid5(uuid.NAMESPACE_DNS, c.chunk_id)) for c in chunks]
     docs = [_chunk_to_document(c) for c in chunks]
-    points = [
-        PointStruct(
-            id=pid,
-            vector={
+
+    if plan.chunkers == ["english_query"]:
+        vectors = [
+            {
                 "": QdrantDocument(text=c.text, model=MINILM_INFERENCE_MODEL),
                 SPARSE_VECTOR_NAME: QdrantDocument(
                     text=c.parent_passage or c.text, model=BM25_INFERENCE_MODEL,
                 ),
-            },
+            }
+            for c in chunks
+        ]
+    elif plan.chunkers == ["qa_pair"]:
+        model = DENSE_INFERENCE_MODEL_FOR[plan.backend]
+        vectors = [
+            {"": QdrantDocument(text=_e5_text(c.text), model=model)}
+            for c in chunks
+        ]
+    else:
+        raise NotImplementedError(
+            f"Unsupported chunkers {plan.chunkers!r} — see pipeline/index_plan.py "
+            "for the registered (backend, chunkers) plans."
+        )
+
+    points = [
+        PointStruct(
+            id=pid, vector=vec,
             payload={"page_content": doc.page_content, "metadata": doc.metadata},
         )
-        for pid, c, doc in zip(ids, chunks, docs)
+        for pid, vec, doc in zip(ids, vectors, docs)
     ]
     client.upsert(collection_name=plan.collection_name, points=points)
 
@@ -250,16 +279,17 @@ def index_language(
     start_passage = ckpt["passages_done"]
     done_chunks   = ckpt["chunks_done"]
 
-    num_rows = count_language_rows(lang, plan.split)
+    num_rows = count_language_rows(lang, plan.split)  # None when Hub-streaming (no local cache)
     passages = iter_passages(iter_language_rows(lang, plan.split), lang, translated=True)
     if start_passage:
         for _ in islice(passages, start_passage):
             pass
     if limit is not None:
         passages = islice(passages, max(0, limit - start_passage))
-        total_for_bar = min(num_rows, limit)
+        # Prefer --limit for the bar when set (passage units). Hub has no row count.
+        total_for_bar = limit if num_rows is None else min(num_rows, limit)
     else:
-        total_for_bar = num_rows
+        total_for_bar = num_rows  # may be None → indeterminate tqdm
 
     passage_idx = start_passage
     batch: list[Chunk] = []
@@ -280,10 +310,13 @@ def index_language(
             done_chunks += len(batch)
             _save_checkpoint(plan, lang, passage_idx, done_chunks)
 
-    if limit is not None and passage_idx < num_rows:
-        # Partial by design (a test run) — leave the checkpoint in place so
-        # a later full run resumes from here instead of starting over.
-        print(f"[{lang}] stopped at {passage_idx:,}/{num_rows:,} passages (--limit); checkpoint saved.")
+    hit_limit = limit is not None and (
+        (num_rows is None and passage_idx >= limit)
+        or (num_rows is not None and passage_idx < num_rows)
+    )
+    if hit_limit:
+        total_label = f"{num_rows:,}" if num_rows is not None else "Hub (unknown total)"
+        print(f"[{lang}] stopped at {passage_idx:,}/{total_label} passages (--limit); checkpoint saved.")
     else:
         _clear_checkpoint(plan, lang)
         register_plan(plan, {lang: done_chunks})

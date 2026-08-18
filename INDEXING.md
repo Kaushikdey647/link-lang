@@ -4,21 +4,19 @@ Indexing is **CLI-only**. There is no button, endpoint, or admin control that
 starts, stops, or resumes an indexing run — the only way to index is:
 
 ```bash
-uv run python -m scripts.index --langs hi bn
+uv run python -m scripts.index --langs hi bn              # qa_pair + e5 (default)
+uv run python -m scripts.index --langs hi --strategy english_query
 ```
 
 This is deliberate: indexing is a heavy, occasional, operator-driven task
 (minutes to hours per language), and keeping it out-of-process means the
-running API/admin server has zero control surface for it. The admin UI's
-**Ingestion** tab (`/admin`) is read-only — it shows you what's actually in
-Qdrant (collections, sizes, per-language counts, mapped plan), never a way to
-trigger anything.
+serving side (`frontend/` — see CHANGELOG.md's `frontend_only` entry) has zero
+control surface for it. Nothing in the Next.js serving app can start, stop,
+or trigger an indexing run.
 
-english-pivot (MiniLM dense + BM25 sparse, both computed server-side by
-Qdrant Cloud) is the system's one supported chunking/embedding strategy — see
-`CHUNKING.md` for what else was prototyped and why. There's no `--backend`/
-`--chunkers` flag to choose; every run uses `IndexPlan(backend="english",
-chunkers=["english_query"])`.
+Default plan is `qa_pair` + `multilingual_e5_small` (dense-only, Qdrant Cloud
+inference). `--strategy english_query` still indexes the MiniLM+BM25 collection.
+See `CHUNKING.md`.
 
 ---
 
@@ -48,21 +46,22 @@ there's no local embedding fallback anymore).
 | Flag | Default | Meaning |
 |---|---|---|
 | `--langs` | `hi` | One or more 2-letter codes, or `all` for all 14 (`as bn gu hi kn ml mr ne or pa sa ta te ur`). |
+| `--strategy` | `qa_pair` | `qa_pair` (e5 dense) or `english_query` (MiniLM+BM25). Each is its own collection. |
 | `--split` | `train` | `train` or `validation`. |
 | `--batch-size` | `256` | Passages embedded + upserted per Qdrant round-trip. |
 | `--workers` | `1` | Parallel language processes. `1` = sequential (today's default). `>1` runs that many languages concurrently, each in its own OS process. |
-| `--limit` | none | Stop after N passages *per language* — for quick test runs. The checkpoint still records exactly where it stopped, so a later un-limited run continues from there. |
+| `--limit` | none | Stop after N passages *per language* — for quick test runs. Bounds Hub transfer when the language parquet is not cached locally. The checkpoint still records exactly where it stopped, so a later un-limited run continues from there. |
 
 ---
 
 ## Collections & IndexPlan
 
 Every run is described by an `IndexPlan` (`pipeline/index_plan.py`):
-`(backend, chunkers, split)`, always `("english", ["english_query"], split)`
-today. The collection name is derived deterministically:
+`(backend, chunkers, split)`. Default is `("multilingual_e5_small", ["qa_pair"], split)`:
 
 ```
-msmarco_xi__english__english_query__{split}
+msmarco_xi__multilingual_e5_small__qa_pair__{split}
+msmarco_xi__english__english_query__{split}   # --strategy english_query
 ```
 
 Running the same `--split` always targets the same collection — that's how
@@ -110,7 +109,7 @@ uv run python -m scripts.index --langs hi bn --limit 5000
 ```
 Stops after 5,000 passages per language. The checkpoint is left in place (not cleared, not registered as done), so:
 - A later un-limited run continues from passage 5,000 rather than starting over.
-- The Ingestion tab / `registry.json` correctly show it as "not registered" rather than falsely complete.
+- `registry.json` correctly shows it as "not registered" rather than falsely complete.
 
 ---
 
@@ -126,18 +125,20 @@ Written after every batch. Deleted only when a language finishes cleanly (not st
 
 ## Registry (`registry.json`)
 
-`.indexer_checkpoints/registry.json` tracks, per collection: backend, model, chunkers, split, and `lang_counts` (chunks indexed per language that's actually finished). This is what backs:
-- `GET /plans` and the "Registered" column in the Ingestion tab.
-- `best_available_plan()` / `get_plan_by_collection()` (`pipeline/index_plan.py`), used by `RAGChain` to pick a collection at query time when none is specified.
+`.indexer_checkpoints/registry.json` tracks, per collection: backend, model, chunkers, split, and `lang_counts` (chunks indexed per language that's actually finished). This is ingestion-side bookkeeping only now — the Next.js serving side (`frontend/`) does **not** read this file; it resolves the live collection directly from Qdrant and caches it in memory per warm instance (`frontend/lib/server/qdrant.ts::getLiveCollection()`), since a serverless deploy's filesystem doesn't survive across invocations. See CHANGELOG.md's `frontend_only` entry.
 
-It's local-only (gitignored — per-machine run state, not source), so it stays in sync automatically rather than being something you'd manually replicate: `run_indexing()` calls `sync_registry_with_qdrant()` after every run, and `GET /health`/`_get_chain()` (`api/routes/query.py`) also call it — any process that hits Qdrant auto-discovers deterministically-named collections it doesn't yet know about and registers them, and prunes entries for collections that no longer exist. This is what lets a fresh machine pointed at an already-populated shared Qdrant Cloud cluster report ready without needing to have run indexing itself. You never edit this file by hand.
+It's local-only (gitignored — per-machine run state, not source), so it stays in sync automatically: `run_indexing()` calls `sync_registry_with_qdrant()` after every run — any process that hits Qdrant auto-discovers deterministically-named collections it doesn't yet know about and registers them, and prunes entries for collections that no longer exist. You never edit this file by hand.
 
 ---
 
 ## Performance notes
 
-- **Streaming dataset load**: `dataset/loader.py::iter_language_rows()` reads each language's parquet file batch-by-batch (`pq.ParquetFile.iter_batches()`), never materializing a full-file Arrow Table — memory stays bounded by batch size, not file size (each language's train parquet is 3.3-4.0GB on disk). This is what `pipeline/indexer.py::index_language()` uses; `--limit` genuinely bounds how much gets read from disk, and `--workers > 1` doesn't multiply full-file loads across processes.
-- **No local embedding model** — dense (MiniLM) and sparse (BM25) vectors are both computed server-side by Qdrant Cloud; nothing to load, no device selection, no local inference cost. See "Remote (Qdrant Cloud) inference" below.
+- **Streaming dataset load (local-first, Hub fallback)**: `dataset/loader.py::iter_language_rows()` prefers a non-empty language parquet in the HF hub cache (`pq.ParquetFile.iter_batches()`). If none is cached, it streams that single shard from the Hub (`hf://datasets/ai4bharat/MSMARCO-XI/train/{prefix}train.parquet`, `streaming=True`) so a new machine never needs the full ~55 GB download. `--limit` bounds how many **passages** are indexed and, on the Hub path, how much data is transferred. Iterating an entire language without `--limit` still eventually reads that language’s ~3.5–4 GB shard. There is no `train` parquet for Telugu (`te`) on the Hub — only `validation/telval.parquet`.
+- **Smoke-test Hub stream** (no Qdrant needed):
+  ```bash
+  uv run python -c "from dataset.loader import iter_language_rows; print(next(iter_language_rows('hi','train'))['query_id'])"
+  ```
+- **No local embedding model** — dense vectors (`intfloat/multilingual-e5-small` for qa_pair; MiniLM+BM25 for english_query) are computed server-side by Qdrant Cloud.
 - **Merged upsert**: dense + sparse vectors are computed and upserted in a single Qdrant call per batch, not two.
 - **Parallelism caveat**: always invoke via `uv run python -m scripts.index`, not `python -m pipeline.indexer` directly. `--workers > 1` uses `ProcessPoolExecutor`'s `spawn` start method, which needs to re-import the worker function from a real module path in each child process — running `pipeline/indexer.py` itself as `__main__` breaks that (confirmed: every worker crashes instantly). `scripts/index.py` exists specifically so `pipeline.indexer` is always imported normally.
 
@@ -148,9 +149,9 @@ It's local-only (gitignored — per-machine run state, not source), so it stays 
 `QDRANT_CLUSTER_ENDPOINT` + `QDRANT_API_KEY` in `.env` control where Qdrant lives *and* who computes embeddings — there's no local embedding fallback, so `QDRANT_API_KEY` is effectively required for the system to do anything useful (`pipeline/indexer.py::QDRANT_CLOUD_INFERENCE`):
 
 1. **Where Qdrant lives** — every `QdrantClient` in the app (`pipeline/indexer.py`, `pipeline/rag.py`, `ui/ingestion_tab.py`, `api/app.py`) connects to the cloud cluster instead of `localhost:6333`.
-2. **Who computes the embedding** — the client sends raw text as a Qdrant `Document(text=..., model=...)` at both index time (`pipeline/indexer.py::_upsert_batch`) and query time (`pipeline/query_engines.py::EnglishPivotQueryEngine`), and Qdrant Cloud computes MiniLM dense + BM25 sparse vectors server-side (`cloud_inference=True` on the client). If `QDRANT_API_KEY` is unset, indexing/serving still runs against local Qdrant, but embedding fails loudly with a Qdrant-side error rather than silently falling back to anything local.
+2. **Who computes the embedding** — the client sends raw text as a Qdrant `Document(text=..., model=...)` at index time (`pipeline/indexer.py::_upsert_batch`) and query time (`frontend/lib/server/retrieval.ts`). Default qa_pair uses `intfloat/multilingual-e5-small` (dense only). `--strategy english_query` uses MiniLM dense + BM25 sparse. If `QDRANT_API_KEY` is unset, indexing/serving still runs against local Qdrant, but embedding fails loudly with a Qdrant-side error rather than silently falling back to anything local.
 
-Nothing else about indexing changes: the dataset still streams from the local parquet cache (`dataset/loader.py::iter_language_rows`), chunking still happens locally (`pipeline/chunking.py`) — only the embedding *computation* moves server-side.
+Nothing else about embedding changes for dataset access: `iter_language_rows` is local-first with Hub streaming fallback (see Performance notes). Chunking still happens locally (`pipeline/chunking.py`) — only the embedding *computation* moves server-side.
 
 ### SOP: testing remote embeddings
 
@@ -173,42 +174,34 @@ This can't be verified from every network (the cluster may be unreachable from s
    uv run python -c "
    from pipeline.indexer import _get_qdrant_client
    from pipeline.index_plan import IndexPlan
-   plan = IndexPlan(backend='english', chunkers=['english_query'], split='train')
+   plan = IndexPlan(backend='multilingual_e5_small', chunkers=['qa_pair'], split='train')
    pts, _ = _get_qdrant_client().scroll(plan.collection_name, limit=1, with_vectors=True)
-   print(pts[0].vector.keys() if isinstance(pts[0].vector, dict) else pts[0].vector)
+   print(pts[0].vector.keys() if isinstance(pts[0].vector, dict) else type(pts[0].vector))
    "
    ```
-   Should print both the unnamed dense vector and the `bm25` sparse vector — non-empty.
+   Should print a dense vector (no `bm25` sparse space on this collection).
 
-4. **Retrieval-only query test** (no `SARVAM_API_KEY` needed — skips generation):
-   ```bash
-   uv run python -c "
-   from pipeline.rag import RAGChain
-   chain = RAGChain(lang='hi')
-   for d in chain.retrieve_only('what was the manhattan project?'):
-       print(d.metadata.get('parent_passage') or d.page_content)
-   "
-   ```
-   This round-trips the query-time `Document(...)`-based dense + sparse Prefetch/RRF fusion — the part that's hardest to reason about without live access.
+4. **Retrieval-only query test** — hit Next.js `retrieveOnly` / `GET /api/health` from `frontend/`; Python `pipeline.rag` is retired.
 
 **Troubleshooting**:
 - Auth errors (401/403) → check `QDRANT_API_KEY`.
 - "Inference not available"/plan-tier errors → your Qdrant Cloud cluster's plan may not include cloud inference; check the cluster's plan/tier.
-- Model-not-found errors → the model identifier must match Qdrant's registry exactly, including casing (`sentence-transformers/all-minilm-l6-v2`, `qdrant/bm25` — both lowercase, per `pipeline/indexer.py::MINILM_INFERENCE_MODEL`/`BM25_INFERENCE_MODEL`).
+- Model-not-found errors → the model identifier must match Qdrant's registry exactly, including casing (`intfloat/multilingual-e5-small` for qa_pair; `sentence-transformers/all-minilm-l6-v2` / `qdrant/bm25` for english_query).
 - Upsert timeouts → embedding now happens synchronously inside the upsert call, so a large `--batch-size` (default 256) may need lowering (e.g. `--batch-size 64`) over a slower/higher-latency connection to the cluster.
 
 ### This task's ingestion command
 
-10,000 passages per language, all 14 languages **except Telugu** (`te`'s train parquet isn't cached locally):
+10,000 passages per language, all languages with a Hub `train` parquet (**except Telugu** — no `train/teltrain.parquet` on the Hub):
 ```bash
 uv run python -m scripts.index --langs as bn gu hi kn ml mr ne or pa sa ta ur --limit 10000 --workers 4
 ```
+On a fresh machine this Hub-streams each language shard; `--limit` stops transfer/indexing early.
 
 ---
 
 ## Observability
 
-Everything indexing writes is visible without touching the CLI again:
-- **Ingestion tab** (`/admin`) — every collection, alias, point count, on-disk size, vector config, mapped plan, registry status, and on-demand per-language breakdown.
-- `GET /plans` — registry contents as JSON.
-- `GET /health` — degraded if no registered plan's collection actually exists in Qdrant.
+The Gradio admin dashboard (Ingestion/Serving tabs) that used to show this is retired along with the rest of the Python serving stack (see CHANGELOG.md's `frontend_only` entry) — a Next.js equivalent is a planned follow-up, not yet built. In the meantime, check indexing progress directly:
+- `GET /api/health` (`frontend/`) — degraded if the live collection doesn't exist/is empty in Qdrant.
+- Qdrant's own dashboard/API (`GET /collections/{name}`, `POST /collections/{name}/points/count`) for point counts and per-language breakdowns.
+- `.indexer_checkpoints/registry.json` and the per-language checkpoint files, directly.

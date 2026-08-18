@@ -1,13 +1,23 @@
-from dataset import load_language, iter_passages, iter_queries
+"""Default ingestion entrypoint — equivalent to:
+
+    uv run python -m scripts.index \\
+      --langs as bn gu hi kn ml mr ne or pa sa ta ur \\
+      --strategy qa_pair \\
+      --limit 1000000 \\
+      --batch-size 512 \\
+      --workers 4
+
+For ad-hoc flags, use `python -m scripts.index` instead.
+Telugu (`te`) is omitted: there is no train parquet on the Hub.
+"""
+
+from __future__ import annotations
+
+from pipeline.index_plan import IndexPlan
+from pipeline.indexer import run_indexing
+
+LANGS = ["as", "bn", "gu", "hi", "kn", "ml", "mr", "ne", "or", "pa", "sa", "ta", "ur"]
 
 if __name__ == "__main__":
-    ds = load_language("hi")
-    print(ds)
-
-    # Sample: first 3 passage records (for indexing)
-    for p in list(iter_passages(ds["train"], "hi"))[:3]:
-        print(p.passage_id, p.is_selected, p.text[:80])
-
-    # Sample: first 3 query records (for evaluation)
-    for q in list(iter_queries(ds["validation"], "hi"))[:3]:
-        print(q.query_id, q.query[:80])
+    plan = IndexPlan(backend="multilingual_e5_small", chunkers=["qa_pair"], split="train")
+    run_indexing(LANGS, plan, batch_size=512, workers=4, limit=1_000_000)
