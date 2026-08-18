@@ -2,10 +2,19 @@
 
 ## [Unreleased]
 
+### Added — Hub parquet streaming when the local MSMARCO-XI cache is missing
+- `dataset/loader.py::iter_language_rows()` is local-first; if no non-empty language parquet is cached, it streams that single shard from the Hub (`load_dataset("parquet", data_files="hf://datasets/ai4bharat/MSMARCO-XI/…", streaming=True)`). `--limit` now bounds Hub transfer on a fresh machine without pulling the full ~55 GB dataset. `count_language_rows()` returns `None` on the Hub path; `pipeline/indexer.py` handles indeterminate progress bars.
+
+### Changed — `main.py` runs the default qa_pair full-corpus index
+- Replaced the deprecation stub with a thin entrypoint that calls `run_indexing` for langs `as bn gu hi kn ml mr ne or pa sa ta ur`, strategy `qa_pair`, `--limit 1000000`, `--batch-size 512`, `--workers 4` (same as the usual CLI invocation). Ad-hoc flags still go through `python -m scripts.index`.
+
+### Fixed — CHUNKING.md rewritten for the live default path
+- Opening sections previously still described english-pivot + Sarvam translate as “the system's one strategy.” Doc now leads with `qa_pair` + `intfloat/multilingual-e5-small`, documents the STT → dense retrieve → generate (no translate) serving flow, and demotes `english_query` to an optional CLI alternate.
+
 ### Added — `qa_pair` chunking strategy reintroduced as a second, separate collection
 - Restored `QAPairChunker` (`pipeline/chunking.py`) and added a `multilingual_e5_small` backend (`pipeline/index_plan.py`, `pipeline/indexer.py`) targeting `intfloat/multilingual-e5-small` via **Qdrant Cloud server-side inference** (dense-only, no BM25) — not the local `sentence-transformers` inference that got the original `e5` backend removed. Indexes into its own collection, `msmarco_xi__multilingual_e5_small__qa_pair__{split}`, leaving the existing `msmarco_xi__english__english_query__train` collection untouched.
 - `scripts/index.py` gains `--strategy {english_query,qa_pair}` (default `qa_pair`) to select between the two registered (backend, chunker) plans.
-- `pipeline/indexer.py::_e5_text()` prepends `"passage: "` to qa_pair text before embedding; query-time embedding in `frontend/lib/server/retrieval.ts` prefixes with `"query: "`.
+- `pipeline/indexer.py::_e5_text()` prepends `"passage: "` to qa_pair text before embedding; query-time embedding in `link-lang-frontend/lib/server/retrieval.ts` prefixes with `"query: "`.
 
 ### Changed — serving flow ported to Next.js (`frontend_only` branch); Python is ingestion-only now
 - Ported the entire serving stack — RRF hybrid retrieval, Sarvam STT/translate/generation, the 4-stage RAGChain harness (guardrails → retrieve → generate → grounding), and guardrails themselves — from Python (FastAPI) to TypeScript, living in `frontend/lib/server/` (`qdrant.ts`, `sarvam.ts`, `retrieval.ts`, `guardrails.ts`, `rag.ts`) and `frontend/app/api/{query,voice,health}/route.ts`. Verified this session, not assumed: `@qdrant/js-client-rest` supports both cloud inference (`{text, model}`) and the Query API's `prefetch`/`FusionQuery({fusion:"rrf"})` — the same pattern the Python `EnglishPivotQueryEngine` used; Sarvam's REST contracts (STT, translate, language-ID, chat completions) were confirmed directly against `docs.sarvam.ai` rather than guessed. Live-tested from this session's environment: a real Sarvam chat-completion call succeeded end-to-end (input guardrail), and the Qdrant Cloud call failed with the exact same "unreachable from this VPN" signature seen from the Python client all session — confirms correct wiring, not a bug.

@@ -77,7 +77,7 @@ QDRANT_CLUSTER_ENDPOINT=...     # Qdrant Cloud cluster URL
 QDRANT_API_KEY=...              # required — no local embedding fallback anymore
 ```
 
-Indexing is CLI-only — see `INDEXING.md` for the full reference (multi-language, parallel workers, resuming).
+Indexing is CLI-only — see `INDEXING.md` for the full reference (multi-language, parallel workers, resuming). Dataset access is **local-first** (HF cache parquet) with **Hub streaming fallback** per language shard, so `--limit` on a new machine does not require downloading all ~55 GB.
 
 ```bash
 uv run python -m scripts.index --langs hi

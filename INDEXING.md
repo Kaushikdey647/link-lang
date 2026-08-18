@@ -50,7 +50,7 @@ there's no local embedding fallback anymore).
 | `--split` | `train` | `train` or `validation`. |
 | `--batch-size` | `256` | Passages embedded + upserted per Qdrant round-trip. |
 | `--workers` | `1` | Parallel language processes. `1` = sequential (today's default). `>1` runs that many languages concurrently, each in its own OS process. |
-| `--limit` | none | Stop after N passages *per language* — for quick test runs. The checkpoint still records exactly where it stopped, so a later un-limited run continues from there. |
+| `--limit` | none | Stop after N passages *per language* — for quick test runs. Bounds Hub transfer when the language parquet is not cached locally. The checkpoint still records exactly where it stopped, so a later un-limited run continues from there. |
 
 ---
 
@@ -133,7 +133,11 @@ It's local-only (gitignored — per-machine run state, not source), so it stays 
 
 ## Performance notes
 
-- **Streaming dataset load**: `dataset/loader.py::iter_language_rows()` reads each language's parquet file batch-by-batch (`pq.ParquetFile.iter_batches()`), never materializing a full-file Arrow Table — memory stays bounded by batch size, not file size (each language's train parquet is 3.3-4.0GB on disk). This is what `pipeline/indexer.py::index_language()` uses; `--limit` genuinely bounds how much gets read from disk, and `--workers > 1` doesn't multiply full-file loads across processes.
+- **Streaming dataset load (local-first, Hub fallback)**: `dataset/loader.py::iter_language_rows()` prefers a non-empty language parquet in the HF hub cache (`pq.ParquetFile.iter_batches()`). If none is cached, it streams that single shard from the Hub (`hf://datasets/ai4bharat/MSMARCO-XI/train/{prefix}train.parquet`, `streaming=True`) so a new machine never needs the full ~55 GB download. `--limit` bounds how many **passages** are indexed and, on the Hub path, how much data is transferred. Iterating an entire language without `--limit` still eventually reads that language’s ~3.5–4 GB shard. There is no `train` parquet for Telugu (`te`) on the Hub — only `validation/telval.parquet`.
+- **Smoke-test Hub stream** (no Qdrant needed):
+  ```bash
+  uv run python -c "from dataset.loader import iter_language_rows; print(next(iter_language_rows('hi','train'))['query_id'])"
+  ```
 - **No local embedding model** — dense vectors (`intfloat/multilingual-e5-small` for qa_pair; MiniLM+BM25 for english_query) are computed server-side by Qdrant Cloud.
 - **Merged upsert**: dense + sparse vectors are computed and upserted in a single Qdrant call per batch, not two.
 - **Parallelism caveat**: always invoke via `uv run python -m scripts.index`, not `python -m pipeline.indexer` directly. `--workers > 1` uses `ProcessPoolExecutor`'s `spawn` start method, which needs to re-import the worker function from a real module path in each child process — running `pipeline/indexer.py` itself as `__main__` breaks that (confirmed: every worker crashes instantly). `scripts/index.py` exists specifically so `pipeline.indexer` is always imported normally.
@@ -147,7 +151,7 @@ It's local-only (gitignored — per-machine run state, not source), so it stays 
 1. **Where Qdrant lives** — every `QdrantClient` in the app (`pipeline/indexer.py`, `pipeline/rag.py`, `ui/ingestion_tab.py`, `api/app.py`) connects to the cloud cluster instead of `localhost:6333`.
 2. **Who computes the embedding** — the client sends raw text as a Qdrant `Document(text=..., model=...)` at index time (`pipeline/indexer.py::_upsert_batch`) and query time (`frontend/lib/server/retrieval.ts`). Default qa_pair uses `intfloat/multilingual-e5-small` (dense only). `--strategy english_query` uses MiniLM dense + BM25 sparse. If `QDRANT_API_KEY` is unset, indexing/serving still runs against local Qdrant, but embedding fails loudly with a Qdrant-side error rather than silently falling back to anything local.
 
-Nothing else about indexing changes: the dataset still streams from the local parquet cache (`dataset/loader.py::iter_language_rows`), chunking still happens locally (`pipeline/chunking.py`) — only the embedding *computation* moves server-side.
+Nothing else about embedding changes for dataset access: `iter_language_rows` is local-first with Hub streaming fallback (see Performance notes). Chunking still happens locally (`pipeline/chunking.py`) — only the embedding *computation* moves server-side.
 
 ### SOP: testing remote embeddings
 
@@ -187,10 +191,11 @@ This can't be verified from every network (the cluster may be unreachable from s
 
 ### This task's ingestion command
 
-10,000 passages per language, all 14 languages **except Telugu** (`te`'s train parquet isn't cached locally):
+10,000 passages per language, all languages with a Hub `train` parquet (**except Telugu** — no `train/teltrain.parquet` on the Hub):
 ```bash
 uv run python -m scripts.index --langs as bn gu hi kn ml mr ne or pa sa ta ur --limit 10000 --workers 4
 ```
+On a fresh machine this Hub-streams each language shard; `--limit` stops transfer/indexing early.
 
 ---
 

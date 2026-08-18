@@ -88,8 +88,9 @@ def _get_qdrant_client() -> QdrantClient:
 
 # ---------------------------------------------------------------------------
 # Sparse (BM25/IDF) vector space — computed server-side by Qdrant Cloud
-# (see MINILM_INFERENCE_MODEL/BM25_INFERENCE_MODEL above), used for RRF
-# hybrid retrieval (frontend/lib/server/retrieval.ts for the english_query plan).
+# (see MINILM_INFERENCE_MODEL/BM25_INFERENCE_MODEL above). Only used by the
+# optional `--strategy english_query` plan. Default/serving is dense-only
+# qa_pair + multilingual-e5-small (no BM25, no translate).
 # ---------------------------------------------------------------------------
 
 SPARSE_VECTOR_NAME = "bm25"
@@ -278,16 +279,17 @@ def index_language(
     start_passage = ckpt["passages_done"]
     done_chunks   = ckpt["chunks_done"]
 
-    num_rows = count_language_rows(lang, plan.split)
+    num_rows = count_language_rows(lang, plan.split)  # None when Hub-streaming (no local cache)
     passages = iter_passages(iter_language_rows(lang, plan.split), lang, translated=True)
     if start_passage:
         for _ in islice(passages, start_passage):
             pass
     if limit is not None:
         passages = islice(passages, max(0, limit - start_passage))
-        total_for_bar = min(num_rows, limit)
+        # Prefer --limit for the bar when set (passage units). Hub has no row count.
+        total_for_bar = limit if num_rows is None else min(num_rows, limit)
     else:
-        total_for_bar = num_rows
+        total_for_bar = num_rows  # may be None → indeterminate tqdm
 
     passage_idx = start_passage
     batch: list[Chunk] = []
@@ -308,10 +310,13 @@ def index_language(
             done_chunks += len(batch)
             _save_checkpoint(plan, lang, passage_idx, done_chunks)
 
-    if limit is not None and passage_idx < num_rows:
-        # Partial by design (a test run) — leave the checkpoint in place so
-        # a later full run resumes from here instead of starting over.
-        print(f"[{lang}] stopped at {passage_idx:,}/{num_rows:,} passages (--limit); checkpoint saved.")
+    hit_limit = limit is not None and (
+        (num_rows is None and passage_idx >= limit)
+        or (num_rows is not None and passage_idx < num_rows)
+    )
+    if hit_limit:
+        total_label = f"{num_rows:,}" if num_rows is not None else "Hub (unknown total)"
+        print(f"[{lang}] stopped at {passage_idx:,}/{total_label} passages (--limit); checkpoint saved.")
     else:
         _clear_checkpoint(plan, lang)
         register_plan(plan, {lang: done_chunks})

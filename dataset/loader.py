@@ -4,7 +4,7 @@ from typing import Iterator
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from datasets import Dataset, DatasetDict
+from datasets import Dataset, DatasetDict, load_dataset
 
 from constants import DATASET_NAME, LANG_CODE_MAP
 
@@ -15,8 +15,25 @@ _HUB_CACHE = os.path.expanduser(
 )
 
 
-def _snapshot() -> str:
-    return os.path.join(_HUB_CACHE, sorted(os.listdir(_HUB_CACHE))[-1])
+def _snapshot() -> str | None:
+    if not os.path.isdir(_HUB_CACHE):
+        return None
+    snaps = sorted(os.listdir(_HUB_CACHE))
+    if not snaps:
+        return None
+    return os.path.join(_HUB_CACHE, snaps[-1])
+
+
+def _parquet_relpath(lang: str, split: str) -> str:
+    """Hub-relative path for one language shard, e.g. train/hintrain.parquet."""
+    prefix = LANG_CODE_MAP.get(lang)
+    if prefix is None:
+        raise ValueError(f"Unknown language {lang!r}. Valid codes: {sorted(LANG_CODE_MAP)}")
+    if split == "train":
+        return f"train/{prefix}train.parquet"
+    if split == "validation":
+        return f"validation/{prefix}val.parquet"
+    raise ValueError(f"Unknown split {split!r}; expected 'train' or 'validation'")
 
 
 def _cast_to_large(t: pa.DataType) -> pa.DataType:
@@ -44,26 +61,55 @@ def _read_parquet(path: str) -> pa.Table:
 
 
 def _resolve_files(lang: str, split: str) -> list[str]:
+    """Local cached parquet paths for lang/split, or [] if nothing is cached."""
     prefix = LANG_CODE_MAP.get(lang)
     if prefix is None and lang != "all":
         raise ValueError(f"Unknown language {lang!r}. Valid codes: {sorted(LANG_CODE_MAP)}")
 
-    split_dir = os.path.join(_snapshot(), split)
+    snap = _snapshot()
+    if snap is None:
+        return []
+
+    split_dir = os.path.join(snap, split)
+    if not os.path.isdir(split_dir):
+        return []
+
     pattern = "*.parquet" if lang == "all" else f"{prefix}*.parquet"
-    files = sorted(glob.glob(os.path.join(split_dir, pattern)))
-    if not files:
-        raise FileNotFoundError(
-            f"No cached parquet files for lang={lang!r} split={split!r} in {split_dir}"
+    return sorted(
+        p for p in glob.glob(os.path.join(split_dir, pattern))
+        if os.path.isfile(p) and os.path.getsize(p) > 0
+    )
+
+
+def _iter_hub_rows(lang: str, split: str) -> Iterator[dict]:
+    """Stream one language shard from the Hub without downloading the full dataset.
+
+    Uses the real parquet paths (train/hintrain.parquet), not the stale
+    BuilderConfig language configs that point at missing *train.jsonl files.
+    """
+    if lang == "all":
+        raise ValueError(
+            "Hub streaming does not support lang='all' — pass individual language codes "
+            "so each process streams a single shard."
         )
-    return files
+    rel = _parquet_relpath(lang, split)
+    uri = f"hf://datasets/{DATASET_NAME}/{rel}"
+    try:
+        ds = load_dataset("parquet", data_files=uri, split="train", streaming=True)
+    except Exception as e:
+        raise FileNotFoundError(
+            f"No Hub parquet for lang={lang!r} split={split!r} at {uri} "
+            f"(e.g. te has no train shard on the Hub). Underlying error: {e}"
+        ) from e
+    yield from ds
 
 
 def load_language(lang: str, splits: tuple[str, ...] = ("train", "validation")) -> DatasetDict:
     """Load MSMARCO-XI for one Indic language from the local HuggingFace cache.
 
-    Fully materializes each split into memory — fine for small/ad-hoc use (see
-    main.py) but NOT for indexing large languages; the CLI (pipeline/indexer.py)
-    uses the streaming iter_language_rows()/count_language_rows() below instead.
+    Fully materializes each split into memory — fine for small/ad-hoc use but
+    NOT for indexing; the CLI uses iter_language_rows()/count_language_rows().
+    Requires a populated local cache (no Hub fallback).
 
     Args:
         lang: 2-letter language code ("hi", "bn", …) or "all" for every language.
@@ -75,32 +121,40 @@ def load_language(lang: str, splits: tuple[str, ...] = ("train", "validation")) 
     result: dict[str, Dataset] = {}
     for split in splits:
         files = _resolve_files(lang, split)
+        if not files:
+            raise FileNotFoundError(
+                f"No cached parquet files for lang={lang!r} split={split!r} — "
+                f"load_language requires a local HF cache (use iter_language_rows for Hub streaming)."
+            )
         table = pa.concat_tables([_read_parquet(f) for f in files])
         result[split] = Dataset(table)
 
     return DatasetDict(result)
 
 
-def count_language_rows(lang: str, split: str) -> int:
-    """Total row count for a language/split — reads only parquet footer metadata
-    (no row-group data), so this is cheap even for multi-GB files."""
-    return sum(pq.ParquetFile(f).metadata.num_rows for f in _resolve_files(lang, split))
+def count_language_rows(lang: str, split: str) -> int | None:
+    """Row count for a language/split from local parquet footers, or None when
+    falling back to Hub streaming (no cheap remote count without downloading)."""
+    files = _resolve_files(lang, split)
+    if not files:
+        return None
+    return sum(pq.ParquetFile(f).metadata.num_rows for f in files)
 
 
 def iter_language_rows(lang: str, split: str, batch_size: int = 5000) -> Iterator[dict]:
-    """Stream rows for a language/split without ever materializing a full-file
-    Arrow Table. Reads each matching parquet file batch-by-batch (bounded by
-    batch_size) and yields one row dict at a time — memory stays O(batch_size),
-    not O(file size), regardless of how many languages run concurrently.
+    """Stream rows for a language/split without materializing a full-file Arrow Table.
 
-    Still uses iter_batches() (not read_table()/ParquetFile.read()) per the
-    PyArrow 25 workaround in _read_parquet(): list<string>-in-struct columns
-    fail to convert via the table-read path. The large_string schema cast that
-    _read_parquet() needs (to survive combine_chunks()'s 2GB offset limit when
-    a whole file becomes one Arrow array) isn't needed here — batches are small
-    enough that the default schema converts to Python objects fine.
+    Local-first: if a non-empty language parquet is in the HF hub cache, read it
+    batch-by-batch via pq.ParquetFile.iter_batches(). Otherwise stream that single
+    shard from the Hub (hf://datasets/.../{prefix}{train|val}.parquet) so --limit
+    only transfers what is iterated — not the full ~55GB dataset.
     """
-    for path in _resolve_files(lang, split):
-        pf = pq.ParquetFile(path)
-        for batch in pf.iter_batches(batch_size=batch_size):
-            yield from batch.to_pylist()
+    files = _resolve_files(lang, split)
+    if files:
+        for path in files:
+            pf = pq.ParquetFile(path)
+            for batch in pf.iter_batches(batch_size=batch_size):
+                yield from batch.to_pylist()
+        return
+
+    yield from _iter_hub_rows(lang, split)
