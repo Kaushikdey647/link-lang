@@ -15,7 +15,7 @@ Usage:
     uv run python -m scripts.index --langs hi bn
     uv run python -m scripts.index --langs all --workers 4
     uv run python -m scripts.index --langs hi --limit 5000   # quick test run
-    uv run python -m scripts.index --langs hi --strategy qa_pair
+    uv run python -m scripts.index --langs hi --strategy english_query
 
 --strategy selects one of the two registered (backend, chunkers) plans (see
 pipeline/index_plan.py) — each is its own Qdrant collection, so switching
@@ -40,7 +40,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--langs", nargs="+", default=["hi"],
                        help="Language codes to index, or 'all' for all 14")
-    parser.add_argument("--strategy", choices=list(STRATEGIES), default="english_query",
+    parser.add_argument("--strategy", choices=list(STRATEGIES), default="qa_pair",
                        help="Which (backend, chunker) plan to index into")
     parser.add_argument("--split",    default="train")
     parser.add_argument("--batch-size", type=int, default=256)

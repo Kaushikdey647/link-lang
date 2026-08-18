@@ -89,7 +89,7 @@ def _get_qdrant_client() -> QdrantClient:
 # ---------------------------------------------------------------------------
 # Sparse (BM25/IDF) vector space — computed server-side by Qdrant Cloud
 # (see MINILM_INFERENCE_MODEL/BM25_INFERENCE_MODEL above), used for RRF
-# hybrid retrieval (pipeline/query_engines.py:EnglishPivotQueryEngine).
+# hybrid retrieval (frontend/lib/server/retrieval.ts for the english_query plan).
 # ---------------------------------------------------------------------------
 
 SPARSE_VECTOR_NAME = "bm25"
@@ -161,8 +161,8 @@ def _e5_text(text: str) -> str:
     # e5 models are trained with an asymmetric "query: "/"passage: " prefix
     # convention — omitting it measurably hurts retrieval quality. qa_pair
     # chunks are indexed (retrieval-target) documents, so "passage: " applies
-    # here; a future query-side embedder must prefix its query text with
-    # "query: " to match.
+    # here; query-time embedding (frontend/lib/server/retrieval.ts) prefixes
+    # with "query: ".
     return f"passage: {text}"
 
 

@@ -6,7 +6,7 @@ Multilingual voice RAG system for MSMARCO-XI. Speak a question in any of 14 Indi
 Voice → Sarvam STT → embed → Qdrant ANN → Sarvam-105B → answer
 ```
 
-**This is the `frontend_only` branch**: the Python repo is ingestion-only now — it streams the dataset, chunks it, and writes directly into Qdrant Cloud (`scripts/index.py`). The entire serving flow (voice/text query, guardrails, RRF retrieval, generation) has been ported to Next.js and lives in `frontend/` — see `frontend/README.md` and `CHANGELOG.md` for what moved and why. The old FastAPI/Gradio serving stack (`api/`, `ui/`, `pipeline/rag.py`, `pipeline/query_engines.py`, `pipeline/guardrails.py`, `stt.py`, `main.py`, `scripts/benchmark.py`) is retired — each file is a short deprecation stub pointing at its Next.js replacement, kept only until you delete them.
+**This is the `frontend_only` branch**: the Python repo is ingestion-only now — it streams the dataset, chunks it, and writes directly into Qdrant Cloud (`scripts/index.py`). The entire serving flow (voice/text query, guardrails, dense e5 retrieval, generation) has been ported to Next.js and lives in `frontend/` — see `frontend/README.md` and `CHANGELOG.md` for what moved and why. The old FastAPI/Gradio serving stack (`api/`, `ui/`, `pipeline/rag.py`, `pipeline/query_engines.py`, `pipeline/guardrails.py`, `stt.py`, `main.py`, `scripts/benchmark.py`) is retired — each file is a short deprecation stub pointing at its Next.js replacement, kept only until you delete them.
 
 ---
 
@@ -18,9 +18,8 @@ Voice → Sarvam STT → embed → Qdrant ANN → Sarvam-105B → answer
 |---|---|---|---|
 | Ingestion | Python (`scripts/index.py`) | Stream MSMARCO-XI → chunk → upsert into Qdrant Cloud | this repo |
 | STT | Sarvam Saaras v3 | Vernacular speech → text | `frontend/lib/server/sarvam.ts` |
-| Embedding | `all-MiniLM-L6-v2` (dense) + BM25 (sparse) — both computed server-side by Qdrant Cloud | Text → vectors | Qdrant Cloud (no local/API embedding anywhere) |
-| Vector DB | Qdrant Cloud | ANN retrieval + payload filter + RRF fusion | `frontend/lib/server/retrieval.ts` |
-| Translation | Sarvam `sarvam-translate:v1` | Query → English (english-pivot retrieval) | `frontend/lib/server/sarvam.ts` |
+| Embedding | `intfloat/multilingual-e5-small` (dense, Qdrant Cloud inference) | Vernacular query/passage → vectors | Qdrant Cloud |
+| Vector DB | Qdrant Cloud | ANN retrieval + payload filter | `frontend/lib/server/retrieval.ts` |
 | Generation | `sarvam-105b` | Grounded answer in target language | `frontend/lib/server/rag.ts` |
 | Guardrails | LLM safety check + lexical grounding check | Off-topic/unsafe rejection, hallucination check | `frontend/lib/server/guardrails.ts` |
 | Serving API | Next.js Route Handlers | `/api/query`, `/api/voice`, `/api/health` | `frontend/app/api/` |
@@ -40,28 +39,23 @@ Each row contains:
 
 ### IndexPlan
 
-english-pivot is the system's one supported strategy (see CHUNKING.md for what
-else was prototyped and why this was chosen) — `backend="english"`,
-`chunkers=["english_query"]` is the only valid `IndexPlan`, giving one
-deterministic collection name:
+Serving + default indexing use `qa_pair` + `multilingual_e5_small`. The older
+english-pivot collection is still indexable via `--strategy english_query`.
 
 ```
-msmarco_xi__english__english_query__{split}
+msmarco_xi__multilingual_e5_small__qa_pair__{split}   # default / serving
+msmarco_xi__english__english_query__{split}           # optional
 ```
 
 ### Chunking + embedding strategy
 
 | | |
 |---|---|
-| Chunker | `english_query` — embeds the English question (`Eng_Query`), returns the vernacular passage as context |
-| Dense embedding | `sentence-transformers/all-MiniLM-L6-v2`, 384-dim — computed server-side by Qdrant Cloud |
-| Sparse embedding | BM25/IDF — also computed server-side by Qdrant Cloud |
-| Retrieval | RRF fusion of the dense + sparse results (`frontend/lib/server/retrieval.ts`) |
+| Chunker | `qa_pair` — embeds vernacular `query + passage`, returns the passage as context |
+| Dense embedding | `intfloat/multilingual-e5-small`, 384-dim — Qdrant Cloud (`passage:` at index, `query:` at serve) |
+| Retrieval | dense ANN on the vernacular query (`frontend/lib/server/retrieval.ts`) |
 
-See [CHUNKING.md](./CHUNKING.md) for the full rationale, including the other
-chunking strategies and embedding backends (vernacular passage/sentence/qa_pair
-chunking; local e5; Cohere API) that were prototyped and evaluated before this
-single-strategy, Qdrant-Cloud-inference-only architecture was chosen.
+See [CHUNKING.md](./CHUNKING.md) for the english-pivot alternative and earlier prototypes.
 
 ### Registry
 
@@ -103,6 +97,8 @@ Environment variables (`frontend/.env.local`):
 SARVAM_API_KEY=...
 QDRANT_CLUSTER_ENDPOINT=...
 QDRANT_API_KEY=...
+QDRANT_COLLECTION_NAME=msmarco_xi__multilingual_e5_small__qa_pair__train
+QDRANT_EMBEDDING_MODEL=intfloat/multilingual-e5-small
 ```
 (Next.js doesn't read the parent directory's `.env` — these need to be set in `frontend/.env.local` separately from the ingestion side's `.env`.)
 
@@ -128,7 +124,7 @@ GET  /api/health     → { "status": "ok"|"degraded", "qdrant": true|false }
 ```
 dataset/           — MSMARCO-XI loading (streaming parquet reader)
 pipeline/
-  chunking.py       — EnglishQueryChunker (the one supported chunker)
+  chunking.py       — QAPairChunker / EnglishQueryChunker
   index_plan.py     — IndexPlan dataclass + registry CRUD + sync_registry_with_qdrant
   indexer.py        — ensure_collection, index_language, run_indexing (import-only, see scripts/index.py)
 scripts/

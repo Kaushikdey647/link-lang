@@ -113,9 +113,9 @@ The tradeoff: english-pivot is English-only on the embedding side (by design —
 
 ### `QAPairChunker` + `multilingual_e5_small` — reintroduced as a second, separate collection
 
-Unlike the `e5` backend above, this doesn't run a local model — it uses **Qdrant Cloud's server-side inference** for `intfloat/multilingual-e5-small` (dense-only, no BM25 sparse), the same cloud-inference mechanism the english-pivot collection uses for MiniLM/BM25. So this avoids the local-inference memory cost that got `e5` removed originally, while still doing genuine vernacular semantic embedding on the query+passage concatenation. It lives in its own collection (`msmarco_xi__multilingual_e5_small__qa_pair__{split}`) rather than replacing english-pivot — see `scripts/index.py --strategy qa_pair`.
+Unlike the local `e5` backend above, this uses **Qdrant Cloud's server-side inference** for `intfloat/multilingual-e5-small` (dense-only). It is the default indexing strategy (`scripts/index.py --strategy qa_pair`) and the Next.js serving path.
 
-e5 models use an asymmetric `"query: "`/`"passage: "` prefix convention; `pipeline/indexer.py::_e5_text()` prepends `"passage: "` at index time since qa_pair chunks are the retrieval target. Any future query-side embedder for this collection must prefix its query text with `"query: "` to match.
+e5's asymmetric prefixes: index time `pipeline/indexer.py::_e5_text()` prepends `"passage: "`; query time `frontend/lib/server/retrieval.ts` prepends `"query: "` to the vernacular query (no English translate hop).
 
 ---
 
